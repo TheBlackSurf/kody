@@ -130,6 +130,7 @@ def update_table_prefix_in_config(wp_config_path, new_prefix):
         print(f"Błąd aktualizacji prefixu w {wp_config_path}: {e}", file=sys.stderr)
         return False
 
+
 # --- Główny skrypt ---
 def main():
     parser = argparse.ArgumentParser(description="Skrypt migracji WordPressa z backupu Izolka Migrate.")
@@ -144,7 +145,7 @@ def main():
     DOWNLOAD_ENDPOINT = f"{SOURCE_BASE_URL}/wp-json/izolka-migrate/v1/download"
 
     exit_code = 0
-    NEW_URL = ""
+    NEW_URL = "" # Zmienna przechowująca docelowy URL
 
     try:
         print(f"Przechodzenie do katalogu WordPressa docelowego: {WP_ROOT_DIR}")
@@ -166,18 +167,11 @@ def main():
             raise Exception(f"Katalog '{WP_ROOT_DIR}' nie wygląda na główny katalog WordPressa (brakuje wp-config.php, wp-admin lub wp-includes).")
         print("Struktura katalogu WordPressa docelowego OK.")
 
-        # Usunięto pytanie o potwierdzenie "TAK"
-        # confirm = input(f"\n!!! OSTRZEŻENIE !!!\nTen skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych\nw docelowej instalacji WordPressa ({WP_ROOT_DIR}).\nJest to operacja DESTRUKCYJNA i NIEODWRACALNA.\n\nCzy na pewno chcesz kontynuować? (wpisz TAK aby potwierdzić): ")
-        # if confirm != "TAK":
-        #     print("Operacja anulowana.")
-        #     sys.exit(0)
-        # print("")
         print(f"\n!!! OSTRZEŻENIE !!!")
         print(f"Ten skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych")
         print(f"w docelowej instalacji WordPressa ({WP_ROOT_DIR}).")
         print(f"Jest to operacja DESTRUKCYJNA i NIEODWRACALNA.")
         print(f"Rozpoczynanie automatycznej migracji...\n")
-
 
         print(f"Przygotowanie tymczasowego katalogu: {FULL_TEMP_DIR}")
         if os.path.exists(FULL_TEMP_DIR): shutil.rmtree(FULL_TEMP_DIR)
@@ -255,6 +249,7 @@ def main():
             else: raise Exception(f"Początkowe 'wp db create' nie powiodło się (kod: {result_db_create_initial.returncode}).")
         else: raise Exception(f"Krytyczny błąd systemowy podczas początkowego 'wp db create'.")
 
+
         print("Krok 2 DB: Usuwanie bazy danych/tabel...")
         result_db_drop = run_command([WP_CLI_BIN, "db", "drop"] + WP_CLI_FLAGS + ["--yes"])
         if result_db_drop is None or result_db_drop.returncode != 0:
@@ -269,11 +264,13 @@ def main():
             else: print("Baza danych już istniała (potwierdzone po 'wp db drop').")
         else: print("Baza danych ponownie utworzona (lub potwierdzono istnienie).")
 
+
         print("Krok 4 DB: Sprawdzanie dostępności bazy danych PRZED importem...")
         check_db_result = run_command([WP_CLI_BIN, "db", "check"] + WP_CLI_FLAGS, check=False)
         if not (check_db_result and check_db_result.returncode == 0):
             print("Ostrzeżenie/Błąd: 'wp db check' nie powiodło się PRZED importem. Być może plik SQL zawiera CREATE DATABASE.", file=sys.stderr)
         else: print("Wynik 'wp db check' przed importem: OK.")
+
 
         print(f"Krok 5 DB: Importowanie bazy danych z backupu: {SQL_FILE_PATH}")
         if not os.path.exists(SQL_FILE_PATH): raise Exception(f"Plik SQL '{SQL_FILE_PATH}' nie istnieje!")
@@ -306,15 +303,20 @@ def main():
                 print(f"Ostrzeżenie: Nie udało się odczytać prefixu tabeli z {backup_wp_config_path}. Zakładam, że obecny jest poprawny.", file=sys.stderr)
         # --- KONIEC AKTUALIZACJI PREFIXU ---
 
-        print(f"Aktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' na '{NEW_URL}'...")
-        search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
-        search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
-        urls_to_replace = [ f"http://{SOURCE_DOMAIN}", f"https://{SOURCE_DOMAIN}", f"http://www.{SOURCE_DOMAIN}", f"https://www.{SOURCE_DOMAIN}" ]
-        for old_url in urls_to_replace:
-            sr_result = run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
-            if sr_result and sr_result.returncode != 0:
-                 print(f"Ostrzeżenie podczas search-replace dla {old_url}. Może to być normalne, jeśli URL nie występował.", file=sys.stderr)
-        print("Aktualizacja URL-i zakończona.")
+        # --- USUNIĘTO SEKCJĘ WP SEARCH-REPLACE ---
+        # print(f"Aktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' na '{NEW_URL}'...")
+        # search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
+        # search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
+        # urls_to_replace = [ f"http://{SOURCE_DOMAIN}", f"https://{SOURCE_DOMAIN}", f"http://www.{SOURCE_DOMAIN}", f"https://www.{SOURCE_DOMAIN}" ]
+        # for old_url in urls_to_replace:
+        #     sr_result = run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
+        #     if sr_result and sr_result.returncode != 0:
+        #          print(f"Ostrzeżenie podczas search-replace dla {old_url}. Może to być normalne, jeśli URL nie występował.", file=sys.stderr)
+        # print("Aktualizacja URL-i zakończona.")
+        print("Pominięto automatyczne wyszukiwanie i zamianę URL-i w bazie danych.")
+        print(f"Skrypt zaktualizuje tylko opcje siteurl i home do '{NEW_URL}'.")
+        print("Będziesz musiał zaktualizować pozostałe wystąpienia starego URL-a ręcznie.")
+        # --- KONIEC USUNIĘTEJ SEKCJI ---
 
         print("Rozpoczęcie migracji plików...")
         print(f"Zachowywanie docelowego wp-config.php do {FULL_TEMP_WP_CONFIG_PATH}...")
@@ -339,7 +341,7 @@ def main():
             os.path.basename(SQL_FILE_PATH),
             FINAL_ZIP_FILE,
             os.path.basename(FULL_TEMP_WP_CONFIG_PATH),
-            "wp-config.php"
+            "wp-config.php" # Wykluczamy również wp-config.php z backupu, używamy docelowego
         ]
         moved_items_count = 0
         for item_name in os.listdir(FULL_TEMP_DIR):
@@ -361,6 +363,8 @@ def main():
         print("Pliki/katalogi z backupu przeniesione.")
 
         print(f"Przywracanie oryginalnego (ale potencjalnie zaktualizowanego o prefix) wp-config.php z {FULL_TEMP_WP_CONFIG_PATH}...")
+        # Plik w docelowym WP_ROOT_DIR jest już właściwy po kroku aktualizacji prefixu
+        # Nie ma potrzeby kopiować go z powrotem, bo tam cały czas był (nie został usunięty/nadpisany)
         print(f"Plik {WP_CONFIG_DEST_PATH_IN_ROOT} powinien już być poprawny (zaktualizowany prefix, jeśli było trzeba).")
 
 
@@ -376,10 +380,13 @@ def main():
         os.chdir(WP_ROOT_DIR)
         print("Odświeżanie permanentnych linków...")
         run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False)
+
+        print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL}...")
         run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
         run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
+        print("'siteurl' i 'home' zaktualizowane.")
 
-        # Usunięto automatyczne aktualizacje
+        # Usunięto automatyczne aktualizacje (były już skomentowane)
         # print("Aktualizacja rdzenia, wtyczek i motywów (opcjonalnie)...")
         # run_command([WP_CLI_BIN, "core", "update"] + WP_CLI_FLAGS, check=False)
         # run_command([WP_CLI_BIN, "plugin", "update", "--all"] + WP_CLI_FLAGS, check=False)
@@ -405,7 +412,11 @@ def main():
             print("\n---------------------------------------------------")
             print("Migracja zakończona!")
             print(f"Docelowa strona powinna teraz działać pod adresem: {NEW_URL}")
-            print("Pamiętaj o ręcznym sprawdzeniu strony i logów serwera!")
+            print("Pamiętaj, że skrypt NIE zaktualizował wszystkich URL-i w bazie danych (np. w treściach artykułów).")
+            print("Musisz wykonać globalne search-replace ręcznie, np. używając:")
+            print(f"wp search-replace 'https://{SOURCE_DOMAIN}' '{NEW_URL}' --all-tables-with-prefix --skip-columns=guid --recurse-objects")
+            print("Pamiętaj o dostosowaniu starego URL-a (http/https/www).")
+            print("Pamiętaj również o ręcznym sprawdzeniu strony i logów serwera!")
             print("---------------------------------------------------")
         elif exit_code == 0:
             print("\n---------------------------------------------------")
