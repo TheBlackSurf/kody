@@ -166,11 +166,18 @@ def main():
             raise Exception(f"Katalog '{WP_ROOT_DIR}' nie wygląda na główny katalog WordPressa (brakuje wp-config.php, wp-admin lub wp-includes).")
         print("Struktura katalogu WordPressa docelowego OK.")
 
-        confirm = input(f"\n!!! OSTRZEŻENIE !!!\nTen skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych\nw docelowej instalacji WordPressa ({WP_ROOT_DIR}).\nJest to operacja DESTRUKCYJNA i NIEODWRACALNA.\n\nCzy na pewno chcesz kontynuować? (wpisz TAK aby potwierdzić): ")
-        if confirm != "TAK":
-            print("Operacja anulowana.")
-            sys.exit(0)
-        print("")
+        # Usunięto pytanie o potwierdzenie "TAK"
+        # confirm = input(f"\n!!! OSTRZEŻENIE !!!\nTen skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych\nw docelowej instalacji WordPressa ({WP_ROOT_DIR}).\nJest to operacja DESTRUKCYJNA i NIEODWRACALNA.\n\nCzy na pewno chcesz kontynuować? (wpisz TAK aby potwierdzić): ")
+        # if confirm != "TAK":
+        #     print("Operacja anulowana.")
+        #     sys.exit(0)
+        # print("")
+        print(f"\n!!! OSTRZEŻENIE !!!")
+        print(f"Ten skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych")
+        print(f"w docelowej instalacji WordPressa ({WP_ROOT_DIR}).")
+        print(f"Jest to operacja DESTRUKCYJNA i NIEODWRACALNA.")
+        print(f"Rozpoczynanie automatycznej migracji...\n")
+
 
         print(f"Przygotowanie tymczasowego katalogu: {FULL_TEMP_DIR}")
         if os.path.exists(FULL_TEMP_DIR): shutil.rmtree(FULL_TEMP_DIR)
@@ -371,7 +378,7 @@ def main():
         run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False)
         run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
         run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
-        
+
         # Usunięto automatyczne aktualizacje
         # print("Aktualizacja rdzenia, wtyczek i motywów (opcjonalnie)...")
         # run_command([WP_CLI_BIN, "core", "update"] + WP_CLI_FLAGS, check=False)
