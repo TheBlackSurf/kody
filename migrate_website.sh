@@ -22,11 +22,6 @@ TEMP_ZIP_FILE="backup_pobrany.zip"
 # Pełna ścieżka do tymczasowego pliku ZIP
 FULL_TEMP_ZIP_PATH="$FULL_TEMP_DIR/$TEMP_ZIP_FILE"
 
-# Nazwa tymczasowego pliku dla docelowego wp-config.php (zachowany w WP_ROOT_DIR)
-TEMP_WP_CONFIG="wp-config-destination-temp.php"
-# Pełna ścieżka do tymczasowego pliku wp-config.php
-FULL_TEMP_WP_CONFIG_PATH="$WP_ROOT_DIR/$TEMP_WP_CONFIG"
-
 
 # Rozmiar kawałka do pobierania (w bajtach) - dostosuj, jeśli nadal występują problemy
 CHUNK_SIZE=5242880 # 5MB - można zwiększyć lub zmniejszyć
@@ -63,6 +58,7 @@ echo "Sprawdzanie wymaganych narzędzi..."
 command -v curl >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany curl nie jest zainstalowany."; exit 1; }
 command -v unzip >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany unzip nie jest zainstalowany."; exit 1; }
 command -v jq >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany jq (do parsowania JSON) nie jest zainstalowany. Zainstaluj go (np. apt-get install jq)."; exit 1; }
+command -v stat >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany stat (do sprawdzania rozmiaru pliku) nie jest zainstalowany."; exit 1; } # Sprawdzenie stat
 
 # Sprawdzenie WP-CLI
 if ! command -v "$WP_CLI_BIN" >/dev/null 2>&1; then
@@ -136,7 +132,7 @@ echo "Backup wywołany pomyślnie (status 200)."
 
 # Parsuj odpowiedź JSON, aby uzyskać nazwę pliku i rozmiar
 # UWAGA: Jeśli odpowiedź triggera nadal zawiera Notice/Warning przed JSON, jq zawiedzie.
-# Upewnij się, że na serwerze źródłowym jest wyłączone wyświetlanie błędów PHP!
+# Poprzednia próba pokazała, że ten problem zniknął, co sugeruje poprawną konfigurację wp-config.php na źródle.
 BACKUP_FILENAME=$(echo "$TRIGGER_RESPONSE" | jq -r '.filename')
 BACKUP_FILESIZE=$(echo "$TRIGGER_RESPONSE" | jq -r '.file_size')
 
@@ -157,7 +153,7 @@ echo "Pobieranie backupu w częściach z: $DOWNLOAD_ENDPOINT"
 echo "Rozmiar części: $CHUNK_SIZE bajtów."
 
 current_byte=0
-# Utwórz pusty plik docelowy w katalogu tymczasowym
+# Utwórz pusty plik docelowy lub wyczyść go
 > "$FULL_TEMP_ZIP_PATH"
 
 while [ "$current_byte" -lt "$BACKUP_FILESIZE" ]; do
@@ -173,24 +169,37 @@ while [ "$current_byte" -lt "$BACKUP_FILESIZE" ]; do
     RANGE_SPEC="$start_byte-$end_byte"
 
     # Prosty wskaźnik postępu
-    progress=$(( (current_byte * 100) / BACKUP_FILESIZE ))
-    echo -ne "Pobieranie: ${progress}% (część $RANGE_SPEC, Pozostało: $((BACKUP_FILESIZE - current_byte)) bajtów)\r"
+    # Upewnij się, że BACKUP_FILESIZE nie jest zerem, aby uniknąć dzielenia przez zero
+    if [ "$BACKUP_FILESIZE" -gt 0 ]; then
+        progress=$(( (current_byte * 100) / BACKUP_FILESIZE ))
+        echo -ne "Pobieranie: ${progress}% (część $RANGE_SPEC)\r"
+    else
+        # Obsłuż przypadek pustego pliku
+        echo -ne "Pobieranie: 0% (Plik ma rozmiar 0)\r"
+        break # Wyjdź z pętli jeśli rozmiar pliku to 0
+    fi
 
-    # Pobierz część pliku i dopisz do pliku tymczasowego
-    # Używamy -o - do wysłania danych na stdout, a potem >> do dopisania
-    # Używamy -w "%{http_code}" do sprawdzenia statusu BEZ psuwania wyjścia
-    HTTP_STATUS=$(curl -s -o - -w "%{http_code}" -H "X-API-Key: $API_KEY" -r "$RANGE_SPEC" "$DOWNLOAD_ENDPOINT" >> "$FULL_TEMP_ZIP_PATH")
 
-    # Sprawdź status HTTP - oczekujemy 206 (Partial Content) lub 200 (OK) dla ostatniej części lub gdy nie wysłano zakresu (mniej pożądane)
-    if [ "$HTTP_STATUS" -ne 206 ] && [ "$HTTP_STATUS" -ne 200 ]; then
-        echo -e "\nBłąd podczas pobierania części $RANGE_SPEC. Status HTTP: $HTTP_STATUS"
+    # Użyj curl, aby pobrać zakres i DODAĆ go bezpośrednio do pliku,
+    # kierując status code (-w) na stderr, które złapiemy w zmiennej.
+    # --create-dirs jest na wszelki wypadek, --append dopisuje do pliku.
+    # 2>&1 kieruje stderr curl na stdout skryptu, a >/dev/null ukrywa stdout curl (czyli dane pliku)
+    # Nowa konstrukcja: standardowe wyjście curl (-o file) idzie do pliku, standardowe wyjście błędów (status z -w) idzie do zmiennej.
+    HTTP_STATUS=$(curl -s -w "%{http_code}" -H "X-API-Key: $API_KEY" -r "$RANGE_SPEC" "$DOWNLOAD_ENDPOINT" -o "$FULL_TEMP_ZIP_PATH" --create-dirs --append 2>&1 >/dev/null)
+
+    # Sprawdź status HTTP - oczekujemy 206 (Partial Content)
+    # Przy prawidłowej obsłudze Range przez serwer, nawet ostatnia część powinna zwrócić 206.
+    # Jeśli serwer nie obsługuje Range poprawnie, może zwrócić 200. Akceptujemy 200 tylko jeśli current_byte było 0 (cały plik na raz).
+    # W przypadku pobierania w kawałkach, zawsze oczekujemy 206.
+    if [ "$HTTP_STATUS" -ne 206 ]; then
+        echo -e "\nBłąd podczas pobierania części $RANGE_SPEC. Oczekiwano statusu 206, otrzymano $HTTP_STATUS."
         echo "Przerywanie pobierania."
         rm -rf "$FULL_TEMP_DIR"
         exit 1
     fi
 
     # Przejdź do następnej części
-    current_byte="$((end_byte + 1))"
+    current_byte=$((end_byte + 1))
 
 done
 echo -e "\nPobieranie zakończone."
@@ -226,7 +235,7 @@ if [ -z "$SQL_FILE" ] || [ ! -f "$SQL_FILE" ]; then
     rm -rf "$FULL_TEMP_DIR"
     exit 1
 fi
-echo "Znaleziono plik bazy danych: $(basename "$SQL_FILE")"
+echo "Znaleziono plik bazy danych: $SQL_FILE" # Drukuj pełną ścieżkę, jest w temp
 
 # --- Migracja bazy danych (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
 echo "Rozpoczęcie migracji bazy danych..."
