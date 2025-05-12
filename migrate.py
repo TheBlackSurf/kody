@@ -229,7 +229,7 @@ def main():
         original_cwd_unzip = os.getcwd()
         try:
             os.chdir(FULL_TEMP_DIR)
-            result_unzip = run_command(["unzip", "-o", FINAL_ZIP_FILE])
+            result_unzip = run_command(["unzip", "-oqq", FINAL_ZIP_FILE])
         finally:
             os.chdir(original_cwd_unzip)
 
