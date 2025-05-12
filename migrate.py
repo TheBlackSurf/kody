@@ -43,9 +43,23 @@ def run_command(command, check=True, **kwargs):
                 result.returncode, command, output=result.stdout, stderr=result.stderr
             )
         if not original_check and result.returncode != 0:
-            print(f"Ostrzeżenie: Komenda '{' '.join(command)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
-            if result.stdout and result.stdout.strip(): print(f"Stdout (Ostrzeżenie):\n{result.stdout.strip()}", file=sys.stderr)
-            if result.stderr and result.stderr.strip(): print(f"Stderr (Ostrzeżenie):\n{result.stderr.strip()}", file=sys.stderr)
+            # Poprawione logowanie ostrzeżeń
+            stderr_output = result.stderr.strip() if result.stderr else ""
+            stdout_output = result.stdout.strip() if result.stdout else ""
+
+            # Nie traktujemy jako błąd, jeśli search-replace nie znalazł nic do zmiany
+            is_search_replace_no_change = (
+                command[1:3] == ["search-replace", command[2]] and # Sprawdzamy czy to search-replace
+                ("No tables found to replace" in stderr_output or "No values changed" in stderr_output)
+            )
+
+            if not is_search_replace_no_change:
+                 print(f"Ostrzeżenie: Komenda '{' '.join(command)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
+                 if stdout_output: print(f"Stdout (Ostrzeżenie):\n{stdout_output}", file=sys.stderr)
+                 if stderr_output: print(f"Stderr (Ostrzeżenie):\n{stderr_output}", file=sys.stderr)
+            else:
+                 print(f"  Komenda '{command[1]}' dla '{command[2]}' zakończona (brak zmian lub brak tabel).")
+
         return result
     except subprocess.CalledProcessError as e:
         print(f"Błąd: Komenda '{' '.join(command)}' zwróciła kod wyjścia {e.returncode}", file=sys.stderr)
@@ -61,6 +75,7 @@ def run_command(command, check=True, **kwargs):
     except Exception as e:
         print(f"Wystąpił nieoczekiwany błąd systemowy podczas uruchamiania komendy: {e}", file=sys.stderr)
         return None
+
 
 def print_progress(current, total, prefix='Pobieranie:'):
     if total == 0: percent, done = 100, 50
@@ -280,7 +295,7 @@ def main():
         print("Baza danych zaimportowana.")
 
         # --- AKTUALIZACJA PREFIXU TABELI W wp-config.php ---
-        print("Sprawdzanie i aktualizacja prefixu tabel w wp-config.php...")
+        print("\nSprawdzanie i aktualizacja prefixu tabel w wp-config.php...")
         backup_wp_config_path = os.path.join(FULL_TEMP_DIR, "wp-config.php")
         if not os.path.exists(backup_wp_config_path):
             print(f"Ostrzeżenie: Nie znaleziono pliku wp-config.php w backupie ({backup_wp_config_path}). Nie można automatycznie zaktualizować prefixu tabel. Zakładam, że jest poprawny.", file=sys.stderr)
@@ -296,32 +311,36 @@ def main():
                     if update_table_prefix_in_config(WP_CONFIG_DEST_PATH_IN_ROOT, backup_table_prefix):
                         print(f"Prefix tabeli w {WP_CONFIG_DEST_PATH_IN_ROOT} zaktualizowany na '{backup_table_prefix}'.")
                     else:
-                        raise Exception(f"Nie udało się zaktualizować prefixu tabeli w {WP_CONFIG_DEST_PATH_IN_ROOT}.")
+                        # Jeśli aktualizacja prefixu się nie uda, to dalsze search-replace i inne operacje DB
+                        # będą działać na złych tabelach. Traktujemy to jako błąd krytyczny.
+                        raise Exception(f"Nie udało się zaktualizować prefixu tabeli w {WP_CONFIG_DEST_PATH_IN_ROOT}. PRZERWANIE SKRYPTU.")
                 else:
                     print("Prefix tabeli w docelowym wp-config.php jest już zgodny z backupem.")
             else:
                 print(f"Ostrzeżenie: Nie udało się odczytać prefixu tabeli z {backup_wp_config_path}. Zakładam, że obecny jest poprawny.", file=sys.stderr)
         # --- KONIEC AKTUALIZACJI PREFIXU ---
 
-        # --- USUNIĘTO SEKCJĘ WP SEARCH-REPLACE ---
-        # print(f"Aktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' na '{NEW_URL}'...")
-        # search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
-        # search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
-        # urls_to_replace = [ f"http://{SOURCE_DOMAIN}", f"https://{SOURCE_DOMAIN}", f"http://www.{SOURCE_DOMAIN}", f"https://www.{SOURCE_DOMAIN}" ]
-        # for old_url in urls_to_replace:
-        #     sr_result = run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
-        #     if sr_result and sr_result.returncode != 0:
-        #          print(f"Ostrzeżenie podczas search-replace dla {old_url}. Może to być normalne, jeśli URL nie występował.", file=sys.stderr)
-        # print("Aktualizacja URL-i zakończona.")
-        print("Pominięto automatyczne wyszukiwanie i zamianę URL-i w bazie danych.")
-        print(f"Skrypt zaktualizuje tylko opcje siteurl i home do '{NEW_URL}'.")
-        print("Będziesz musiał zaktualizować pozostałe wystąpienia starego URL-a ręcznie.")
-        # --- KONIEC USUNIĘTEJ SEKCJI ---
+        # --- WP SEARCH-REPLACE ---
+        print(f"\nAktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}'...")
+        search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
+        # Dodajemy --precise, --recurse-objects, --report-changed-only dla dokładności i raportowania
+        search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
+        urls_to_replace = [ f"http://{SOURCE_DOMAIN}", f"https://{SOURCE_DOMAIN}", f"http://www.{SOURCE_DOMAIN}", f"https://www.{SOURCE_DOMAIN}" ]
+
+        for old_url in urls_to_replace:
+            # check=False jest ustawione w run_command, aby nie zatrzymywać skryptu,
+            # jeśli search-replace nie znalazł danego URL-a. Ostrzeżenia są logowane w run_command.
+            run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
+
+        print("Wyszukiwanie i zamiana URL-i w bazie danych zakończona.")
+        # --- KONIEC WP SEARCH-REPLACE ---
+
 
         print("Rozpoczęcie migracji plików...")
         print(f"Zachowywanie docelowego wp-config.php do {FULL_TEMP_WP_CONFIG_PATH}...")
         if not os.path.exists(WP_CONFIG_DEST_PATH_IN_ROOT):
             raise Exception(f"Nie znaleziono docelowego wp-config.php w {WP_ROOT_DIR}!")
+        # Wcześniej już zaktualizowaliśmy ten plik o poprawny prefix, więc po prostu go zachowujemy
         shutil.copy2(WP_CONFIG_DEST_PATH_IN_ROOT, FULL_TEMP_WP_CONFIG_PATH)
         print("Docelowy wp-config.php zachowany.")
 
@@ -381,17 +400,19 @@ def main():
         print("Odświeżanie permanentnych linków...")
         run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False)
 
-        print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL}...")
+        # Aktualizacja siteurl i home jest nadal potrzebna, nawet po search-replace,
+        # ponieważ są to kluczowe opcje WP.
+        print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL} (dodatkowe upewnienie)...")
         run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
         run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
         print("'siteurl' i 'home' zaktualizowane.")
 
-        # Usunięto automatyczne aktualizacje (były już skomentowane)
-        # print("Aktualizacja rdzenia, wtyczek i motywów (opcjonalnie)...")
+
+        print("Pominięto aktualizację rdzenia, wtyczek i motywów (jak w poprzedniej wersji).")
         # run_command([WP_CLI_BIN, "core", "update"] + WP_CLI_FLAGS, check=False)
         # run_command([WP_CLI_BIN, "plugin", "update", "--all"] + WP_CLI_FLAGS, check=False)
         # run_command([WP_CLI_BIN, "theme", "update", "--all"] + WP_CLI_FLAGS, check=False)
-        print("Pominięto aktualizację rdzenia, wtyczek i motywów.")
+
 
         print("Czyszczenie cache WP...")
         run_command([WP_CLI_BIN, "cache", "flush"] + WP_CLI_FLAGS, check=False)
@@ -402,26 +423,29 @@ def main():
         exit_code = 1
     finally:
         if exit_code != 0:
-            print(f"WAŻNE: Katalog tymczasowy {FULL_TEMP_DIR} NIE został usunięty z powodu błędu. Sprawdź jego zawartość.", file=sys.stderr)
+            print(f"\nWAŻNE: Katalog tymczasowy {FULL_TEMP_DIR} NIE został usunięty z powodu błędu. Sprawdź jego zawartość.", file=sys.stderr)
             print(f"Możesz go usunąć ręcznie: rm -rf {FULL_TEMP_DIR}", file=sys.stderr)
         else:
-            print("Sprzątanie plików tymczasowych...")
+            print("\nSprzątanie plików tymczasowych...")
             cleanup_temp_dir()
 
         if exit_code == 0 and NEW_URL:
             print("\n---------------------------------------------------")
-            print("Migracja zakończona!")
+            print("Migracja zakończona pomyślnie!")
             print(f"Docelowa strona powinna teraz działać pod adresem: {NEW_URL}")
-            print("Pamiętaj, że skrypt NIE zaktualizował wszystkich URL-i w bazie danych (np. w treściach artykułów).")
-            print("Musisz wykonać globalne search-replace ręcznie, np. używając:")
-            print(f"wp search-replace 'https://{SOURCE_DOMAIN}' '{NEW_URL}' --all-tables-with-prefix --skip-columns=guid --recurse-objects")
-            print("Pamiętaj o dostosowaniu starego URL-a (http/https/www).")
-            print("Pamiętaj również o ręcznym sprawdzeniu strony i logów serwera!")
+            print(f"Skrypt WYKONAŁ automatyczne wyszukiwanie i zamianę URL-i")
+            print(f"(z '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}') we wszystkich tabelach z prefixem.")
+            print("Operacja wp search-replace została przeprowadzona z opcjami: --all-tables-with-prefix --recurse-objects --skip-columns=guid --precise --report-changed-only")
+            print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera!")
             print("---------------------------------------------------")
         elif exit_code == 0:
+             # Ten przypadek jest mało prawdopodobny, jeśli NEW_URL nie został pobrany,
+             # bo błąd powinien ustawić exit_code na 1. Ale zostawiamy dla pewności.
             print("\n---------------------------------------------------")
-            print("Migracja zakończona (lub anulowana/błąd przed pobraniem URL).")
+            print("Migracja zakończona.")
+            print("Sprawdź logi powyżej pod kątem ewentualnych ostrzeżeń lub błędów.")
             print("---------------------------------------------------")
+
 
         sys.exit(exit_code)
 
