@@ -1,405 +1,411 @@
-#!/bin/bash
+#!/usr/bin/env python3
+
+import requests
+import os
+import subprocess
+import shutil
+import json
+import sys
+import time
+import math # Do wskaźnika postępu
+import argparse
+import re # Do operacji na stringach (regex)
 
 # --- Konfiguracja ---
-# Ścieżka do katalogu instalacji WordPressa, do którego skrypt MA przejść
-# Zmień tę ścieżkę, jeśli Twoja instalacja WordPressa jest w innym miejscu
-WP_ROOT_DIR="/var/www/html/wp"
-
-# Nazwa katalogu na backupy w wp-content (używana przez wtyczkę Izolka Migrate)
-BACKUP_DIR_NAME="izolka-backups"
-# Ścieżka do katalogu wp-content w docelowej instalacji
-WP_CONTENT_DIR="$WP_ROOT_DIR/wp-content"
-# Pełna ścieżka do katalogu backupów w docelowej instalacji
-FULL_BACKUP_DIR="$WP_CONTENT_DIR/$BACKUP_DIR_NAME"
-
-# Nazwa tymczasowego katalogu do pobierania i rozpakowywania
-TEMP_DIR_NAME="izolka-migration-temp"
-# Pełna ścieżka do tymczasowego katalogu (będzie utworzony w WP_ROOT_DIR)
-FULL_TEMP_DIR="$WP_ROOT_DIR/$TEMP_DIR_NAME"
-
-# Nazwa tymczasowego pliku ZIP (będzie pobierany DO TEGO KATALOGU w kawałkach)
-TEMP_ZIP_FILE="backup_pobrany.zip"
-# Pełna ścieżka do tymczasowego pliku ZIP
-FULL_TEMP_ZIP_PATH="$FULL_TEMP_DIR/$TEMP_ZIP_FILE"
-
-
-# Rozmiar kawałka do pobierania (w bajtach) - dostosuj, jeśli nadal występują problemy
-CHUNK_SIZE=5242880 # 5MB - można zwiększyć lub zmniejszyć
-
-# Opcjonalnie: Pełna ścieżka do WP-CLI, jeśli nie jest w PATH
-# WP_CLI_BIN="/usr/local/bin/wp"
-WP_CLI_BIN="wp" # Zakładamy, że 'wp' jest w PATH
-
-# Flaga --allow-root dla WP-CLI - Używaj ostrożnie!
-WP_CLI_FLAGS="--allow-root"
-
-
-# --- Sprawdzenie argumentów ---
-if [ "$#" -ne 2 ]; then
-    echo "Użycie: $0 <url_strony_zrodlowej_bez_http_s> <klucz_api_izolka>"
-    echo "Przykład: $0 cbmc.pl SKOPIOWANY_NOWY_KLUCZ_IZOLKA"
-    exit 1
-fi
-
-SOURCE_DOMAIN="$1"
-API_KEY="$2"
-
-SOURCE_BASE_URL="https://$SOURCE_DOMAIN" # Zakładamy https dla API
-TRIGGER_ENDPOINT="$SOURCE_BASE_URL/wp-json/izolka-migrate/v1/trigger"
-DOWNLOAD_ENDPOINT="$SOURCE_BASE_URL/wp-json/izolka-migrate/v1/download"
-
-# --- Przejście do katalogu docelowego WordPressa ---
-echo "Przechodzenie do katalogu WordPressa docelowego: $WP_ROOT_DIR"
-cd "$WP_ROOT_DIR" || { echo "Błąd: Nie można przejść do katalogu WordPressa: $WP_ROOT_DIR. Sprawdź, czy katalog istnieje i masz do niego uprawnienia."; exit 1; }
-echo "Jesteś w katalogu: $(pwd)"
-
-# --- Sprawdzenie wymaganych narzędzi ---
-echo "Sprawdzanie wymaganych narzędzi..."
-command -v curl >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany curl nie jest zainstalowany."; exit 1; }
-command -v unzip >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany unzip nie jest zainstalowany."; exit 1; }
-command -v jq >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany jq (do parsowania JSON) nie jest zainstalowany. Zainstaluj go (np. apt-get install jq)."; exit 1; }
-command -v stat >/dev/null 2>&1 || { echo >&2 "Błąd: wymagany stat (do sprawdzania rozmiaru pliku) nie jest zainstalowany."; exit 1; } # Sprawdzenie stat
-
-# Sprawdzenie WP-CLI
-if ! command -v "$WP_CLI_BIN" >/dev/null 2>&1; then
-    echo >&2 "Błąd: WP-CLI ('$WP_CLI_BIN') nie jest zainstalowane lub nie ma go w PATH. Zainstaluj WP-CLI."
-    exit 1
-fi
-# Sprawdzenie, czy można uruchomić WP-CLI z --allow-root (w bieżącym katalogu WP)
-if ! "$WP_CLI_BIN" --version "$WP_CLI_FLAGS" >/dev/null 2>&1; then
-    echo >&2 "Błąd: Nie można uruchomić WP-CLI z '$WP_CLI_FLAGS' w katalogu '$WP_ROOT_DIR'. Sprawdź uprawnienia lub konfigurację."
-    exit 1
-fi
-
-echo "Narzędzia OK."
-
-# --- Sprawdzenie struktury katalogu docelowego WP ---
-# Sprawdzamy TERAZ, gdy już jesteśmy w katalogu docelowym
-if [ ! -f "wp-config.php" ] || [ ! -d "wp-admin" ] || [ ! -d "wp-includes" ]; then
-    echo "Błąd: Katalog '$WP_ROOT_DIR' nie wygląda na główny katalog instalacji WordPressa."
-    echo "Brak plików/katalogów: wp-config.php, wp-admin, wp-includes."
-    exit 1
-fi
-echo "Struktura katalogu WordPressa docelowego OK."
-
-# --- Potwierdzenie operacji ---
-echo ""
-echo "!!! OSTRZEŻENIE !!!"
-echo "Ten skrypt POBIERZE backup z $SOURCE_BASE_URL i CAŁKOWICIE nadpisze pliki i bazę danych"
-echo "w docelowej instalacji WordPressa ($WP_ROOT_DIR)."
-echo "Jest to operacja DESTRUKCYJNA i NIEODWRACALNA."
-echo ""
-read -r -p "Czy na pewno chcesz kontynuować? (wpisz TAK aby potwierdzić): " confirm
-if [ "$confirm" != "TAK" ]; then
-    echo "Operacja anulowana."
-    exit 0
-fi
-echo ""
-
-# --- Przygotowanie tymczasowego katalogu (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Przygotowanie tymczasowego katalogu: $FULL_TEMP_DIR"
-rm -rf "$FULL_TEMP_DIR" # Usuń poprzednie tymczasowe pliki
-mkdir -p "$FULL_TEMP_DIR"
-if [ $? -ne 0 ]; then echo "Błąd: Nie można utworzyć katalogu tymczasowego w $WP_ROOT_DIR."; exit 1; fi
-echo "Katalog tymczasowy OK."
-
-# --- Wywołanie backupu na źródle i pobranie informacji ---
-echo "Wywoływanie backupu na stronie źródłowej: $TRIGGER_ENDPOINT"
-# Użyj curl do wywołania POST i pobrania odpowiedzi JSON
-TRIGGER_RESPONSE=$(curl -s -X POST -H "X-API-Key: $API_KEY" "$TRIGGER_ENDPOINT")
-TRIGGER_HTTP_STATUS=$(echo "$TRIGGER_RESPONSE" | head -n 1 | grep -oP '(?<=HTTP/1.1 )\d+') # Spróbuj sparsować status z odpowiedzi
-
-# Jeśli odpowiedź curl -s nie zaczyna się od HTTP/1.1 (bo nie ma np. błędów nagłówka), pobierz status inaczej
-if [ -z "$TRIGGER_HTTP_STATUS" ]; then
-    # Pobierz tylko status bez treści
-    TRIGGER_HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" -X POST -H "X-API-Key: $API_KEY" "$TRIGGER_ENDPOINT")
-    # Spróbuj ponownie pobrać treść - może tym razem będzie czysty JSON po wcześniejszym żądaniu?
-    # To uproszczenie - lepsze byłoby logowanie błędu na źródle
-    if [ "$TRIGGER_HTTP_STATUS" -eq 200 ]; then
-         TRIGGER_RESPONSE=$(curl -s -X POST -H "X-API-Key: $API_KEY" "$TRIGGER_ENDPOINT")
-    fi
-fi
-
-
-if [ "$TRIGGER_HTTP_STATUS" -ne 200 ]; then
-    echo "Błąd: Nie udało się wywołać backupu. Status HTTP: $TRIGGER_HTTP_STATUS"
-    echo "Odpowiedź serwera:"
-    echo "$TRIGGER_RESPONSE"
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Backup wywołany pomyślnie (status 200)."
-
-# Parsuj odpowiedź JSON, aby uzyskać nazwę pliku i rozmiar
-# UWAGA: Jeśli odpowiedź triggera nadal zawiera Notice/Warning przed JSON, jq zawiedzie.
-# Poprzednia próba pokazała, że ten problem zniknął, co sugeruje poprawną konfigurację wp-config.php na źródle.
-BACKUP_FILENAME=$(echo "$TRIGGER_RESPONSE" | jq -r '.filename')
-BACKUP_FILESIZE=$(echo "$TRIGGER_RESPONSE" | jq -r '.file_size')
-
-if [ "$BACKUP_FILENAME" == "null" ] || [ "$BACKUP_FILESIZE" == "null" ] || [ -z "$BACKUP_FILENAME" ] || [ -z "$BACKUP_FILESIZE" ]; then
-    echo "Błąd: Nie udało się pobrać nazwy pliku lub rozmiaru z odpowiedzi triggera."
-    echo "Sprawdź, czy odpowiedź z serwera źródłowego jest czystym JSON bez dodatkowego tekstu (np. PHP Notices)."
-    echo "Odpowiedź serwera (RAW):"
-    echo "$TRIGGER_RESPONSE"
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-
-echo "Informacje o backupie: Plik: $BACKUP_FILENAME, Rozmiar: $BACKUP_FILESIZE bajtów."
-
-
-# --- Pobieranie backupu w częściach (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Pobieranie backupu w częściach z: $DOWNLOAD_ENDPOINT"
-echo "Rozmiar części: $CHUNK_SIZE bajtów."
-
-current_byte=0
-# Utwórz pusty plik docelowy lub wyczyść go
-> "$FULL_TEMP_ZIP_PATH"
-
-while [ "$current_byte" -lt "$BACKUP_FILESIZE" ]; do
-    start_byte="$current_byte"
-    end_byte="$((current_byte + CHUNK_SIZE - 1))"
-
-    # Upewnij się, że end_byte nie przekracza rozmiaru pliku
-    if [ "$end_byte" -ge "$BACKUP_FILESIZE" ]; then
-        end_byte="$((BACKUP_FILESIZE - 1))"
-    fi
-
-    # Zakres żądania dla curl
-    RANGE_SPEC="$start_byte-$end_byte"
-
-    # Prosty wskaźnik postępu
-    # Upewnij się, że BACKUP_FILESIZE nie jest zerem, aby uniknąć dzielenia przez zero
-    if [ "$BACKUP_FILESIZE" -gt 0 ]; then
-        progress=$(( (current_byte * 100) / BACKUP_FILESIZE ))
-        echo -ne "Pobieranie: ${progress}% (część $RANGE_SPEC)\r"
-    else
-        # Obsłuż przypadek pustego pliku
-        echo -ne "Pobieranie: 0% (Plik ma rozmiar 0)\r"
-        break # Wyjdź z pętli jeśli rozmiar pliku to 0
-    fi
-
-
-    # Użyj curl, aby pobrać zakres i DODAĆ go bezpośrednio do pliku,
-    # kierując status code (-w) na stderr, które złapiemy w zmiennej.
-    # --create-dirs jest na wszelki wypadek, --append dopisuje do pliku.
-    # 2>&1 kieruje stderr curl na stdout skryptu, a >/dev/null ukrywa stdout curl (czyli dane pliku)
-    # Nowa konstrukcja: standardowe wyjście curl (-o file) idzie do pliku, standardowe wyjście błędów (status z -w) idzie do zmiennej.
-    HTTP_STATUS=$(curl -s -w "%{http_code}" -H "X-API-Key: $API_KEY" -r "$RANGE_SPEC" "$DOWNLOAD_ENDPOINT" -o "$FULL_TEMP_ZIP_PATH" --create-dirs --append 2>&1 >/dev/null)
-
-    # Sprawdź status HTTP - oczekujemy 206 (Partial Content)
-    # Przy prawidłowej obsłudze Range przez serwer, nawet ostatnia część powinna zwrócić 206.
-    # Jeśli serwer nie obsługuje Range poprawnie, może zwrócić 200. Akceptujemy 200 tylko jeśli current_byte było 0 (cały plik na raz).
-    # W przypadku pobierania w kawałkach, zawsze oczekujemy 206.
-    if [ "$HTTP_STATUS" -ne 206 ]; then
-        echo -e "\nBłąd podczas pobierania części $RANGE_SPEC. Oczekiwano statusu 206, otrzymano $HTTP_STATUS."
-        echo "Przerywanie pobierania."
-        rm -rf "$FULL_TEMP_DIR"
-        exit 1
-    fi
-
-    # Przejdź do następnej części
-    current_byte=$((end_byte + 1))
-
-done
-echo -e "\nPobieranie zakończone."
-
-echo "Weryfikacja rozmiaru pobranego pliku..."
-DOWNLOADED_SIZE=$(stat -c %s "$FULL_TEMP_ZIP_PATH" 2>/dev/null) # Użyj stat do sprawdzenia rozmiaru
-
-if [ -z "$DOWNLOADED_SIZE" ] || [ "$DOWNLOADED_SIZE" -ne "$BACKUP_FILESIZE" ]; then
-    echo "Błąd: Rozmiar pobranego pliku ($DOWNLOADED_SIZE bajtów) nie zgadza się z rozmiarem oczekiwanym ($BACKUP_FILESIZE bajtów) lub plik nie istnieje."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-
-echo "Backup pobrany pomyślnie do: $FULL_TEMP_ZIP_PATH"
-
-# --- Rozpakowanie backupu (TERAZ JESTEŚMY W WP_ROOT_DIR, rozpakowujemy z TEMP_DIR) ---
-echo "Rozpakowywanie backupu..."
-# Rozpakuj do katalogu tymczasowego
-unzip -o "$FULL_TEMP_ZIP_PATH" -d "$FULL_TEMP_DIR/"
-if [ $? -ne 0 ]; then
-    echo "Błąd: Nie udało się rozpakować pliku backupu w $FULL_TEMP_DIR."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Backup rozpakowany."
-
-# --- Identyfikacja plików backupu (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-# Znajdź plik SQL - zakładamy, że jest jeden SQL z patternu database_*.sql w rozpakowanym katalogu tymczasowym
-SQL_FILE=$(find "$FULL_TEMP_DIR" -maxdepth 1 -name 'database_*.sql' -print -quit)
-
-if [ -z "$SQL_FILE" ] || [ ! -f "$SQL_FILE" ]; then
-    echo "Błąd: Nie znaleziono pliku bazy danych (.sql) w rozpakowanym backupie w $FULL_TEMP_DIR."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Znaleziono plik bazy danych: $SQL_FILE" # Drukuj pełną ścieżkę, jest w temp
-
-# --- Migracja bazy danych (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Rozpoczęcie migracji bazy danych..."
-
-# Pobierz aktualny URL strony docelowej
-NEW_URL=$("$WP_CLI_BIN" option get siteurl "$WP_CLI_FLAGS" 2>/dev/null)
-if [ -z "$NEW_URL" ]; then
-    echo "Błąd: Nie można pobrać adresu URL docelowej strony za pomocą WP-CLI."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Docelowy URL strony (nowy): $NEW_URL"
-
-# Usunięcie istniejących tabel w bazie danych docelowej
-# Używamy WP-CLI do zrzucenia bazy - bezpieczniejsze niż bezpośrednie operacje mysql
-echo "Usuwanie istniejących tabel w bazie danych docelowej..."
-"$WP_CLI_BIN" db drop "$WP_CLI_FLAGS" --yes
-if [ $? -ne 0 ]; then
-    echo "Błąd: Nie udało się usunąć tabel w bazie danych docelowej za pomocą WP-CLI."
-    echo "Sprawdź uprawnienia bazy danych dla użytkownika w wp-config.php."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Istniejące tabele usunięte."
-
-# Import nowej bazy danych
-echo "Importowanie bazy danych z backupu: $SQL_FILE"
-"$WP_CLI_BIN" db import "$SQL_FILE" "$WP_CLI_FLAGS"
-if [ $? -ne 0 ]; then
-    echo "Błąd: Nie udało się zaimportować bazy danych z backupu."
-    rm -rf "$FULL_TEMP_DIR"
-    exit 1
-fi
-echo "Baza danych zaimportowana."
-
-# Aktualizacja URL-i w bazie danych
-echo "Aktualizacja URL-i w bazie danych: zamiana '$SOURCE_DOMAIN' na '$NEW_URL'..."
-# WP-CLI search-replace jest inteligentne i domyślnie obsługuje serializowane dane
-# Próbujemy zamienić popularne warianty URL starej strony na nowy URL docelowy
-"$WP_CLI_BIN" search-replace "http://$SOURCE_DOMAIN" "$NEW_URL" "$WP_CLI_FLAGS" --recurse-objects --skip-columns=guid --precise --all-tables --report-changed-only
-"$WP_CLI_BIN" search-replace "https://$SOURCE_DOMAIN" "$NEW_URL" "$WP_CLI_FLAGS" --recurse-objects --skip-columns=guid --precise --all-tables --report-changed-only
-"$WP_CLI_BIN" search-replace "http://www.$SOURCE_DOMAIN" "$NEW_URL" "$WP_CLI_FLAGS" --recurse-objects --skip-columns=guid --precise --all-tables --report-changed-only
-"$WP_CLI_BIN" search-replace "https://www.$SOURCE_DOMAIN" "$NEW_URL" "$WP_CLI_FLAGS" --recurse-objects --skip-columns=guid --precise --all-tables --report-changed-only
-
-# Opcjonalnie: Zamień tylko siteurl i home, jeśli wiesz, że to wystarczy
-# "$WP_CLI_BIN" option update siteurl "$NEW_URL" "$WP_CLI_FLAGS"
-# "$WP_CLI_BIN" option update home "$NEW_URL" "$WP_CLI_FLAGS"
-
-echo "Aktualizacja URL-i zakończona."
-
-# --- Migracja plików (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Rozpoczęcie migracji plików..."
-
-# Zachowaj docelowy wp-config.php
-if [ -f "$WP_ROOT_DIR/wp-config.php" ]; then
-    echo "Zachowywanie docelowego wp-config.php..."
-    cp "$WP_ROOT_DIR/wp-config.php" "$FULL_TEMP_WP_CONFIG_PATH"
-    if [ $? -ne 0 ]; then echo "Błąd: Nie udało się zachować docelowego wp-config.php"; rm -rf "$FULL_TEMP_DIR"; exit 1; fi
-else
-     echo "Błąd: Nie znaleziono docelowego wp-config.php!"
-     rm -rf "$FULL_TEMP_DIR"
-     exit 1
-fi
-
-# Usuń istniejące pliki WordPressa (oprócz katalogu backupów i tymczasowych plików)
-echo "Usuwanie istniejących plików WordPressa (z wyjątkiem $BACKUP_DIR_NAME i tymczasowych)..."
-# Użyj find i usuń tylko te elementy w WP_ROOT_DIR, które NIE SĄ katalogiem backupów, ani tymczasowym katalogiem, ani tymczasowym wp-config, ani docelowym wp-config
-find "$WP_ROOT_DIR" -mindepth 1 -maxdepth 1 \
-    -not -name "$(basename "$FULL_TEMP_DIR")" \
-    -not -name "$(basename "$FULL_TEMP_WP_CONFIG_PATH")" \
-    -not -name "wp-config.php" \
-    -not -name "$BACKUP_DIR_NAME" \
-    -exec rm -rf {} +
-if [ $? -ne 0 ]; then echo "Błąd: Wystąpiły problemy podczas usuwania istniejących plików."; rm -rf "$FULL_TEMP_DIR"; exit 1; fi
-echo "Istniejące pliki usunięte."
-
-# Przenieś rozpakowane pliki z backupu (oprócz pliku SQL i wp-config.php z backupu)
-echo "Przenoszenie plików z backupu z $FULL_TEMP_DIR/ do $WP_ROOT_DIR/ ..."
-# Przenieś wszystkie elementy z katalogu tymczasowego, z wyjątkiem pliku SQL, pliku ZIP i wp-config.php z backupu
-find "$FULL_TEMP_DIR" -mindepth 1 -maxdepth 1 \
-    -not -name "$(basename "$SQL_FILE")" \
-    -not -name "$TEMP_ZIP_FILE" \
-    -not -name "wp-config.php" \
-    -exec mv {} "$WP_ROOT_DIR/" \;
-if [ $? -ne 0 ]; then echo "Błąd: Wystąpiły problemy podczas przenoszenia plików z backupu."; rm -rf "$FULL_TEMP_DIR"; exit 1; fi
-echo "Pliki z backupu przeniesione."
-
-# Przywróć docelowy wp-config.php
-echo "Przywracanie docelowego wp-config.php..."
-if [ -f "$FULL_TEMP_WP_CONFIG_PATH" ]; then
-    mv "$FULL_TEMP_WP_CONFIG_PATH" "$WP_ROOT_DIR/wp-config.php"
-    if [ $? -ne 0 ]; then echo "Błąd: Nie udało się przywrócić docelowego wp-config.php"; rm -rf "$FULL_TEMP_DIR"; exit 1; fi
-    echo "Docelowy wp-config.php przywrócony."
-else
-     echo "Błąd: Tymczasowy plik wp-config.php nie istnieje! Krytyczny błąd!"
-     rm -rf "$FULL_TEMP_DIR"
-     exit 1
-fi
-
-
-# --- Ustawienie uprawnień plików (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-# Założenie: Użytkownik webservera to www-data, standardowe uprawnienia 755/644
-echo "Ustawianie uprawnień plików (chown www-data:www-data, chmod 755/644) w $WP_ROOT_DIR..."
-# Zmień właściciela na użytkownika serwera WWW
-chown -R www-data:www-data "$WP_ROOT_DIR"
-if [ $? -ne 0 ]; then echo "Ostrzeżenie: Nie udało się zmienić właściciela plików."; fi
-
-# Ustaw uprawnienia dla katalogów (755) i plików (644)
-find "$WP_ROOT_DIR" -type d -exec chmod 755 {} +
-if [ $? -ne 0 ]; then echo "Ostrzeżenie: Nie udało się ustawić uprawnień dla katalogów."; fi
-find "$WP_ROOT_DIR" -type f -exec chmod 644 {} +
-if [ $? -ne 0 ]; then echo "Ostrzeżenie: Nie udało się ustawić uprawnień dla plików."; fi
-
-# Ustaw specjalne uprawnienia dla wp-config.php (opcjonalnie, 600 lub 640)
-chmod 640 "$WP_ROOT_DIR/wp-config.php" 2>/dev/null # Nie wszystkie serwery tego wymagają, ignoruj błąd jeśli się pojawi
-# Upewnij się, że katalog backupów ma odpowiednie uprawnienia (powinien mieć z aktywacji wtyczki, ale na wszelki wypadek)
-mkdir -p "$FULL_BACKUP_DIR" # Upewnij się, że katalog backupów istnieje na docelowym serwerze po migracji
-chown -R www-data:www-data "$FULL_BACKUP_DIR"
-chmod 755 "$FULL_BACKUP_DIR"
-# Upewnij się, że katalog uploads ma odpowiednie uprawnienia
-mkdir -p "$WP_ROOT_DIR/wp-content/uploads"
-chown -R www-data:www-data "$WP_ROOT_DIR/wp-content/uploads"
-chmod 755 "$WP_ROOT_DIR/wp-content/uploads"
-
-
-echo "Uprawnienia plików ustawione."
-
-
-# --- WP-CLI - kroki po migracji (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Wykonywanie końcowych operacji WP-CLI..."
-
-# Aktualizacja permanentnych linków/reguł przepisywania
-echo "Odświeżanie permanentnych linków..."
-"$WP_CLI_BIN" rewrite flush "$WP_CLI_FLAGS" --hard
-if [ $? -ne 0 ]; then echo "Ostrzeżenie: Nie udało się odświeżyć permanentnych linków."; fi
-
-# Aktualizacja opcji (np. upewnij się, że wszystko jest OK po search-replace)
-"$WP_CLI_BIN" option update siteurl "$NEW_URL" "$WP_CLI_FLAGS" 2>/dev/null # Ustaw URL ponownie na wszelki wypadek
-"$WP_CLI_BIN" option update home "$NEW_URL" "$WP_CLI_FLAGS" 2>/dev/null
-
-# Opcjonalnie: Zaktualizuj rdzeń, wtyczki i motywy
-echo "Aktualizacja rdzenia, wtyczek i motywów (opcjonalnie)..."
-"$WP_CLI_BIN" core update "$WP_CLI_FLAGS"
-"$WP_CLI_BIN" plugin update --all "$WP_CLI_FLAGS"
-"$WP_CLI_BIN" theme update --all "$WP_CLI_FLAGS"
-
-# Wyczyść cache WP (jeśli istnieje)
-echo "Czyszczenie cache WP..."
-"$WP_CLI_BIN" cache flush "$WP_CLI_FLAGS" 2>/dev/null # Ignoruj błąd, jeśli cache nie istnieje
-
-echo "Operacje WP-CLI zakończone."
-
-
-# --- Sprzątanie (TERAZ JESTEŚMY W WP_ROOT_DIR) ---
-echo "Sprzątanie plików tymczasowych..."
-# Upewnij się, że usuwasz katalog tymczasowy stworzony W WP_ROOT_DIR
-rm -rf "$FULL_TEMP_DIR"
-echo "Sprzątanie zakończone."
-
-echo ""
-echo "---------------------------------------------------"
-echo "Migracja zakończona pomyślnie!"
-echo "Docelowa strona powinna teraz działać pod adresem: $NEW_URL"
-echo "Pamiętaj o ręcznym sprawdzeniu strony po migracji!"
-echo "---------------------------------------------------"
-
-exit 0
+WP_ROOT_DIR = "/var/www/html/wp"
+BACKUP_DIR_NAME = "izolka-backups"
+WP_CONTENT_DIR_NAME = "wp-content"
+TEMP_DIR_NAME = "izolka-migration-temp"
+FULL_TEMP_DIR = os.path.join(WP_ROOT_DIR, TEMP_DIR_NAME)
+FULL_TEMP_WP_CONFIG_PATH = os.path.join(FULL_TEMP_DIR, "wp-config.php.original_target")
+FINAL_ZIP_FILE = "backup_finalny.zip"
+FULL_FINAL_ZIP_PATH = os.path.join(FULL_TEMP_DIR, FINAL_ZIP_FILE)
+CHUNK_SIZE = 5242880 # 5MB
+WP_CLI_BIN = "wp"
+WP_CLI_FLAGS = ["--allow-root"]
+WEB_USER = "www-data"
+WEB_GROUP = "www-data"
+
+# --- Funkcje pomocnicze ---
+
+def run_command(command, check=True, **kwargs):
+    print(f"-> Uruchamiam: {' '.join(command)}")
+    effective_kwargs = kwargs.copy()
+    if 'capture_output' not in effective_kwargs:
+        effective_kwargs['capture_output'] = True
+    if 'text' not in effective_kwargs:
+        effective_kwargs['text'] = True
+    original_check = check
+    try:
+        result = subprocess.run(command, check=False, **effective_kwargs)
+        if original_check and result.returncode != 0:
+            raise subprocess.CalledProcessError(
+                result.returncode, command, output=result.stdout, stderr=result.stderr
+            )
+        if not original_check and result.returncode != 0:
+            print(f"Ostrzeżenie: Komenda '{' '.join(command)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
+            if result.stdout and result.stdout.strip(): print(f"Stdout (Ostrzeżenie):\n{result.stdout.strip()}", file=sys.stderr)
+            if result.stderr and result.stderr.strip(): print(f"Stderr (Ostrzeżenie):\n{result.stderr.strip()}", file=sys.stderr)
+        return result
+    except subprocess.CalledProcessError as e:
+        print(f"Błąd: Komenda '{' '.join(command)}' zwróciła kod wyjścia {e.returncode}", file=sys.stderr)
+        if e.stdout and e.stdout.strip(): print(f"Stdout (Błąd):\n{e.stdout.strip()}", file=sys.stderr)
+        if e.stderr and e.stderr.strip(): print(f"Stderr (Błąd):\n{e.stderr.strip()}", file=sys.stderr)
+        return None
+    except FileNotFoundError:
+        print(f"Błąd: Komenda '{command[0]}' nie znaleziona.", file=sys.stderr)
+        return None
+    except PermissionError as e:
+        print(f"Błąd uprawnień podczas próby uruchomienia '{command[0]}': {e}", file=sys.stderr)
+        return None
+    except Exception as e:
+        print(f"Wystąpił nieoczekiwany błąd systemowy podczas uruchamiania komendy: {e}", file=sys.stderr)
+        return None
+
+def print_progress(current, total, prefix='Pobieranie:'):
+    if total == 0: percent, done = 100, 50
+    else:
+        done = math.floor(50 * current / total)
+        percent = math.floor(100 * current / total)
+    sys.stdout.write(f"\r{prefix} [{'-' * done}{' ' * (50 - done)}] {percent}%")
+    sys.stdout.flush()
+
+def get_file_size(filepath):
+    try: return os.path.getsize(filepath)
+    except FileNotFoundError: return None
+    except Exception as e:
+        print(f"\nBłąd: Nie można pobrać rozmiaru pliku '{filepath}': {e}", file=sys.stderr)
+        return None
+
+def cleanup_temp_dir():
+    if os.path.exists(FULL_TEMP_DIR):
+        try:
+            shutil.rmtree(FULL_TEMP_DIR)
+            print(f"Katalog tymczasowy {FULL_TEMP_DIR} usunięty.")
+        except Exception as e:
+            print(f"Ostrzeżenie: Nie udało się usunąć katalogu tymczasowego '{FULL_TEMP_DIR}': {e}", file=sys.stderr)
+    else:
+        print(f"Katalog tymczasowy {FULL_TEMP_DIR} nie istniał, nie ma czego sprzątać.")
+
+def get_table_prefix_from_config(wp_config_path):
+    """Odczytuje $table_prefix z pliku wp-config.php."""
+    try:
+        with open(wp_config_path, 'r', encoding='utf-8') as f:
+            content = f.read()
+        match = re.search(r"\$table_prefix\s*=\s*'([^']+)';", content)
+        if match:
+            return match.group(1)
+        else:
+            print(f"Nie znaleziono definicji $table_prefix w {wp_config_path}", file=sys.stderr)
+            return None
+    except Exception as e:
+        print(f"Błąd odczytu prefixu z {wp_config_path}: {e}", file=sys.stderr)
+        return None
+
+def update_table_prefix_in_config(wp_config_path, new_prefix):
+    """Aktualizuje $table_prefix w pliku wp-config.php."""
+    try:
+        with open(wp_config_path, 'r', encoding='utf-8') as f:
+            lines = f.readlines()
+
+        updated_lines = []
+        prefix_updated = False
+        for line in lines:
+            if line.strip().startswith("$table_prefix"):
+                updated_lines.append(f"$table_prefix = '{new_prefix}';\n")
+                prefix_updated = True
+            else:
+                updated_lines.append(line)
+
+        if prefix_updated:
+            with open(wp_config_path, 'w', encoding='utf-8') as f:
+                f.writelines(updated_lines)
+            print(f"Zaktualizowano $table_prefix na '{new_prefix}' w {wp_config_path}")
+            return True
+        else:
+            print(f"Nie znaleziono linii $table_prefix do aktualizacji w {wp_config_path}", file=sys.stderr)
+            return False
+
+    except Exception as e:
+        print(f"Błąd aktualizacji prefixu w {wp_config_path}: {e}", file=sys.stderr)
+        return False
+
+# --- Główny skrypt ---
+def main():
+    parser = argparse.ArgumentParser(description="Skrypt migracji WordPressa z backupu Izolka Migrate.")
+    parser.add_argument("source_url", help="URL strony źródłowej (bez http/https), np. cbmc.pl")
+    parser.add_argument("api_key", help="Klucz API wtyczki Izolka Migrate ze strony źródłowej.")
+    args = parser.parse_args()
+
+    SOURCE_DOMAIN = args.source_url
+    API_KEY = args.api_key
+    SOURCE_BASE_URL = f"https://{SOURCE_DOMAIN}"
+    TRIGGER_ENDPOINT = f"{SOURCE_BASE_URL}/wp-json/izolka-migrate/v1/trigger"
+    DOWNLOAD_ENDPOINT = f"{SOURCE_BASE_URL}/wp-json/izolka-migrate/v1/download"
+
+    exit_code = 0
+    NEW_URL = ""
+
+    try:
+        print(f"Przechodzenie do katalogu WordPressa docelowego: {WP_ROOT_DIR}")
+        os.chdir(WP_ROOT_DIR)
+        print(f"Jesteś w katalogu: {os.getcwd()}")
+
+        print("Sprawdzanie wymaganych narzędzi...")
+        if not shutil.which("unzip"): raise Exception("Wymagany 'unzip' nie jest zainstalowany.")
+        if not shutil.which(WP_CLI_BIN): raise Exception(f"WP-CLI ('{WP_CLI_BIN}') nie jest zainstalowane.")
+
+        wp_version_result = run_command([WP_CLI_BIN, "--version"] + WP_CLI_FLAGS)
+        if wp_version_result is None or wp_version_result.returncode != 0:
+            raise Exception(f"Nie można uruchomić WP-CLI. Sprawdź uprawnienia/konfigurację.")
+        if wp_version_result.stdout: print(wp_version_result.stdout.strip())
+        print("Narzędzia OK.")
+
+        WP_CONFIG_DEST_PATH_IN_ROOT = os.path.join(WP_ROOT_DIR, "wp-config.php")
+        if not all(os.path.exists(p) for p in [WP_CONFIG_DEST_PATH_IN_ROOT, "wp-admin", "wp-includes"]):
+            raise Exception(f"Katalog '{WP_ROOT_DIR}' nie wygląda na główny katalog WordPressa (brakuje wp-config.php, wp-admin lub wp-includes).")
+        print("Struktura katalogu WordPressa docelowego OK.")
+
+        confirm = input(f"\n!!! OSTRZEŻENIE !!!\nTen skrypt POBIERZE backup z {SOURCE_BASE_URL} i CAŁKOWICIE nadpisze pliki i bazę danych\nw docelowej instalacji WordPressa ({WP_ROOT_DIR}).\nJest to operacja DESTRUKCYJNA i NIEODWRACALNA.\n\nCzy na pewno chcesz kontynuować? (wpisz TAK aby potwierdzić): ")
+        if confirm != "TAK":
+            print("Operacja anulowana.")
+            sys.exit(0)
+        print("")
+
+        print(f"Przygotowanie tymczasowego katalogu: {FULL_TEMP_DIR}")
+        if os.path.exists(FULL_TEMP_DIR): shutil.rmtree(FULL_TEMP_DIR)
+        os.makedirs(FULL_TEMP_DIR)
+        print("Katalog tymczasowy OK.")
+
+        print(f"Wywoływanie backupu na stronie źródłowej: {TRIGGER_ENDPOINT}")
+        headers = {"X-API-Key": API_KEY}
+        trigger_response = requests.post(TRIGGER_ENDPOINT, headers=headers, timeout=60)
+        trigger_response.raise_for_status()
+        trigger_data = trigger_response.json()
+        if not trigger_data.get('success'):
+            raise Exception(f"Błąd triggera: {trigger_data.get('message', 'Nieznany błąd')}")
+        backup_filename = trigger_data['filename']
+        backup_filesize = int(trigger_data['file_size'])
+        print(f"Informacje o backupie: Plik: {backup_filename}, Rozmiar: {backup_filesize} bajtów.")
+
+        print(f"Pobieranie backupu z: {DOWNLOAD_ENDPOINT}")
+        downloaded_size = 0
+        if backup_filesize == 0:
+            with open(FULL_FINAL_ZIP_PATH, 'wb') as f: pass
+            print_progress(0,0)
+            print("\nPusty plik utworzony.")
+        else:
+            with requests.get(DOWNLOAD_ENDPOINT, headers=headers, stream=True, timeout=300) as r:
+                r.raise_for_status()
+                with open(FULL_FINAL_ZIP_PATH, 'wb') as f:
+                    for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+                        print_progress(downloaded_size, backup_filesize)
+            print("\nPobieranie zakończone.")
+
+        ACTUAL_DOWNLOADED_SIZE = get_file_size(FULL_FINAL_ZIP_PATH)
+        if ACTUAL_DOWNLOADED_SIZE is None or ACTUAL_DOWNLOADED_SIZE != backup_filesize:
+            raise Exception(f"Rozmiar pliku ({ACTUAL_DOWNLOADED_SIZE}) != oczekiwany ({backup_filesize}).")
+        print(f"Backup pobrany pomyślnie do: {FULL_FINAL_ZIP_PATH}")
+
+        print("Rozpakowywanie backupu...")
+        original_cwd_unzip = os.getcwd()
+        try:
+            os.chdir(FULL_TEMP_DIR)
+            result_unzip = run_command(["unzip", "-o", FINAL_ZIP_FILE])
+        finally:
+            os.chdir(original_cwd_unzip)
+
+        if result_unzip is None or result_unzip.returncode != 0:
+            raise Exception(f"Błąd rozpakowywania.")
+        if result_unzip.stdout and result_unzip.stdout.strip():
+             print(f"Wynik unzip:\n{result_unzip.stdout.strip()}")
+        print("Backup rozpakowany.")
+
+        print("Identyfikacja plików backupu...")
+        sql_files = [f for f in os.listdir(FULL_TEMP_DIR) if f.endswith('.sql') and f.startswith('database_')]
+        if len(sql_files) != 1:
+            raise Exception(f"Oczekiwano 1 pliku SQL, znaleziono {len(sql_files)}: {sql_files}")
+        SQL_FILE_PATH = os.path.join(FULL_TEMP_DIR, sql_files[0])
+        print(f"Znaleziono plik bazy danych: {SQL_FILE_PATH}")
+
+        print("Rozpoczęcie migracji bazy danych...")
+        print(f"Pobieranie docelowego URL strony z {WP_ROOT_DIR}...")
+        result_siteurl = run_command([WP_CLI_BIN, "option", "get", "siteurl"] + WP_CLI_FLAGS)
+        if result_siteurl is None or result_siteurl.returncode != 0 or not result_siteurl.stdout:
+            raise Exception(f"Błąd krytyczny: Nie udało się pobrać 'siteurl'.")
+        NEW_URL = result_siteurl.stdout.strip()
+        if not NEW_URL:
+            raise Exception(f"Błąd krytyczny: Pobrany 'siteurl' jest pusty.")
+        print(f"Docelowy URL strony (nowy): {NEW_URL}")
+
+        print(f"Krok 1 DB: Wstępne sprawdzanie/tworzenie bazy danych...")
+        result_db_create_initial = run_command([WP_CLI_BIN, "db", "create"] + WP_CLI_FLAGS, check=False)
+        if result_db_create_initial is not None:
+            if result_db_create_initial.returncode == 0: print("Baza danych utworzona lub potwierdzono istnienie (kod 0).")
+            elif result_db_create_initial.stderr and "database exists" in result_db_create_initial.stderr.lower(): print("Baza danych już istniała (komunikat od MySQL).")
+            else: raise Exception(f"Początkowe 'wp db create' nie powiodło się (kod: {result_db_create_initial.returncode}).")
+        else: raise Exception(f"Krytyczny błąd systemowy podczas początkowego 'wp db create'.")
+
+        print("Krok 2 DB: Usuwanie bazy danych/tabel...")
+        result_db_drop = run_command([WP_CLI_BIN, "db", "drop"] + WP_CLI_FLAGS + ["--yes"])
+        if result_db_drop is None or result_db_drop.returncode != 0:
+            raise Exception(f"Nie udało się wykonać 'wp db drop' (kod: {result_db_drop.returncode if result_db_drop else 'brak'}).")
+        print("Operacja 'wp db drop' zakończona.")
+
+        print("Krok 3 DB: Ponowne tworzenie bazy danych (jeśli została usunięta)...")
+        result_db_create_after_drop = run_command([WP_CLI_BIN, "db", "create"] + WP_CLI_FLAGS, check=False)
+        if result_db_create_after_drop is None or result_db_create_after_drop.returncode != 0:
+            if not (result_db_create_after_drop.stderr and "database exists" in result_db_create_after_drop.stderr.lower()):
+                 raise Exception(f"Ponowne 'wp db create' po 'wp db drop' nie powiodło się (kod: {result_db_create_after_drop.returncode if result_db_create_after_drop else 'brak'}).")
+            else: print("Baza danych już istniała (potwierdzone po 'wp db drop').")
+        else: print("Baza danych ponownie utworzona (lub potwierdzono istnienie).")
+
+        print("Krok 4 DB: Sprawdzanie dostępności bazy danych PRZED importem...")
+        check_db_result = run_command([WP_CLI_BIN, "db", "check"] + WP_CLI_FLAGS, check=False)
+        if not (check_db_result and check_db_result.returncode == 0):
+            print("Ostrzeżenie/Błąd: 'wp db check' nie powiodło się PRZED importem. Być może plik SQL zawiera CREATE DATABASE.", file=sys.stderr)
+        else: print("Wynik 'wp db check' przed importem: OK.")
+
+        print(f"Krok 5 DB: Importowanie bazy danych z backupu: {SQL_FILE_PATH}")
+        if not os.path.exists(SQL_FILE_PATH): raise Exception(f"Plik SQL '{SQL_FILE_PATH}' nie istnieje!")
+        result_db_import = run_command([WP_CLI_BIN, "db", "import", SQL_FILE_PATH] + WP_CLI_FLAGS)
+        if result_db_import is None or result_db_import.returncode != 0:
+            raise Exception(f"Nie udało się zaimportować bazy danych (wp db import).")
+        print("Baza danych zaimportowana.")
+
+        # --- AKTUALIZACJA PREFIXU TABELI W wp-config.php ---
+        print("Sprawdzanie i aktualizacja prefixu tabel w wp-config.php...")
+        backup_wp_config_path = os.path.join(FULL_TEMP_DIR, "wp-config.php")
+        if not os.path.exists(backup_wp_config_path):
+            print(f"Ostrzeżenie: Nie znaleziono pliku wp-config.php w backupie ({backup_wp_config_path}). Nie można automatycznie zaktualizować prefixu tabel. Zakładam, że jest poprawny.", file=sys.stderr)
+        else:
+            backup_table_prefix = get_table_prefix_from_config(backup_wp_config_path)
+            if backup_table_prefix:
+                print(f"Prefix tabeli odczytany z backupu: '{backup_table_prefix}'")
+                current_target_table_prefix = get_table_prefix_from_config(WP_CONFIG_DEST_PATH_IN_ROOT)
+                print(f"Obecny prefix tabeli w docelowym wp-config.php: '{current_target_table_prefix}'")
+
+                if backup_table_prefix != current_target_table_prefix:
+                    print(f"Prefixy tabel różnią się. Aktualizuję docelowy {WP_CONFIG_DEST_PATH_IN_ROOT}...")
+                    if update_table_prefix_in_config(WP_CONFIG_DEST_PATH_IN_ROOT, backup_table_prefix):
+                        print(f"Prefix tabeli w {WP_CONFIG_DEST_PATH_IN_ROOT} zaktualizowany na '{backup_table_prefix}'.")
+                    else:
+                        raise Exception(f"Nie udało się zaktualizować prefixu tabeli w {WP_CONFIG_DEST_PATH_IN_ROOT}.")
+                else:
+                    print("Prefix tabeli w docelowym wp-config.php jest już zgodny z backupem.")
+            else:
+                print(f"Ostrzeżenie: Nie udało się odczytać prefixu tabeli z {backup_wp_config_path}. Zakładam, że obecny jest poprawny.", file=sys.stderr)
+        # --- KONIEC AKTUALIZACJI PREFIXU ---
+
+        print(f"Aktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' na '{NEW_URL}'...")
+        search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
+        search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
+        urls_to_replace = [ f"http://{SOURCE_DOMAIN}", f"https://{SOURCE_DOMAIN}", f"http://www.{SOURCE_DOMAIN}", f"https://www.{SOURCE_DOMAIN}" ]
+        for old_url in urls_to_replace:
+            sr_result = run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
+            if sr_result and sr_result.returncode != 0:
+                 print(f"Ostrzeżenie podczas search-replace dla {old_url}. Może to być normalne, jeśli URL nie występował.", file=sys.stderr)
+        print("Aktualizacja URL-i zakończona.")
+
+        print("Rozpoczęcie migracji plików...")
+        print(f"Zachowywanie docelowego wp-config.php do {FULL_TEMP_WP_CONFIG_PATH}...")
+        if not os.path.exists(WP_CONFIG_DEST_PATH_IN_ROOT):
+            raise Exception(f"Nie znaleziono docelowego wp-config.php w {WP_ROOT_DIR}!")
+        shutil.copy2(WP_CONFIG_DEST_PATH_IN_ROOT, FULL_TEMP_WP_CONFIG_PATH)
+        print("Docelowy wp-config.php zachowany.")
+
+        target_wp_content_full_path = os.path.join(WP_ROOT_DIR, WP_CONTENT_DIR_NAME)
+        print(f"Usuwanie istniejącego katalogu {target_wp_content_full_path} (jeśli istnieje)...")
+        if os.path.isdir(target_wp_content_full_path):
+            shutil.rmtree(target_wp_content_full_path)
+            print(f"Katalog {target_wp_content_full_path} usunięty.")
+        elif os.path.exists(target_wp_content_full_path):
+             os.remove(target_wp_content_full_path)
+             print(f"Plik {target_wp_content_full_path} (oczekiwano katalogu) usunięty.")
+        else:
+            print(f"Katalog {target_wp_content_full_path} nie istniał.")
+
+        print(f"Przenoszenie zawartości z backupu ({FULL_TEMP_DIR}) do {WP_ROOT_DIR}...")
+        items_to_exclude_from_move = [
+            os.path.basename(SQL_FILE_PATH),
+            FINAL_ZIP_FILE,
+            os.path.basename(FULL_TEMP_WP_CONFIG_PATH),
+            "wp-config.php"
+        ]
+        moved_items_count = 0
+        for item_name in os.listdir(FULL_TEMP_DIR):
+            if item_name not in items_to_exclude_from_move:
+                source_item_path = os.path.join(FULL_TEMP_DIR, item_name)
+                destination_item_path = os.path.join(WP_ROOT_DIR, item_name)
+
+                if os.path.exists(destination_item_path):
+                    print(f"Ostrzeżenie: Element docelowy {destination_item_path} istnieje. Zostanie nadpisany przez element z backupu.")
+                    if os.path.isdir(destination_item_path): shutil.rmtree(destination_item_path)
+                    else: os.remove(destination_item_path)
+
+                shutil.move(source_item_path, destination_item_path)
+                moved_items_count +=1
+                print(f"Przeniesiono: {item_name} do {destination_item_path}")
+
+        if moved_items_count == 0 :
+             print("Ostrzeżenie: Nie przeniesiono żadnych głównych elementów z backupu (np. wp-content). Sprawdź strukturę backupu.")
+        print("Pliki/katalogi z backupu przeniesione.")
+
+        print(f"Przywracanie oryginalnego (ale potencjalnie zaktualizowanego o prefix) wp-config.php z {FULL_TEMP_WP_CONFIG_PATH}...")
+        print(f"Plik {WP_CONFIG_DEST_PATH_IN_ROOT} powinien już być poprawny (zaktualizowany prefix, jeśli było trzeba).")
+
+
+        print(f"Ustawianie uprawnień plików w {WP_ROOT_DIR}...")
+        os.chdir(WP_ROOT_DIR)
+        run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", "."], check=False)
+        run_command(["find", ".", "-type", "d", "-exec", "chmod", "755", "{}", "+"], check=False)
+        run_command(["find", ".", "-type", "f", "-exec", "chmod", "644", "{}", "+"], check=False)
+        if os.path.exists("wp-config.php"): run_command(["chmod", "640", "wp-config.php"], check=False)
+        print("Uprawnienia plików ustawione.")
+
+        print("Wykonywanie końcowych operacji WP-CLI...")
+        os.chdir(WP_ROOT_DIR)
+        print("Odświeżanie permanentnych linków...")
+        run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False)
+        run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
+        run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
+        
+        # Usunięto automatyczne aktualizacje
+        # print("Aktualizacja rdzenia, wtyczek i motywów (opcjonalnie)...")
+        # run_command([WP_CLI_BIN, "core", "update"] + WP_CLI_FLAGS, check=False)
+        # run_command([WP_CLI_BIN, "plugin", "update", "--all"] + WP_CLI_FLAGS, check=False)
+        # run_command([WP_CLI_BIN, "theme", "update", "--all"] + WP_CLI_FLAGS, check=False)
+        print("Pominięto aktualizację rdzenia, wtyczek i motywów.")
+
+        print("Czyszczenie cache WP...")
+        run_command([WP_CLI_BIN, "cache", "flush"] + WP_CLI_FLAGS, check=False)
+        print("Operacje WP-CLI zakończone.")
+
+    except Exception as e:
+        print(f"KRYTYCZNY BŁĄD SKRYPTU: {e}", file=sys.stderr)
+        exit_code = 1
+    finally:
+        if exit_code != 0:
+            print(f"WAŻNE: Katalog tymczasowy {FULL_TEMP_DIR} NIE został usunięty z powodu błędu. Sprawdź jego zawartość.", file=sys.stderr)
+            print(f"Możesz go usunąć ręcznie: rm -rf {FULL_TEMP_DIR}", file=sys.stderr)
+        else:
+            print("Sprzątanie plików tymczasowych...")
+            cleanup_temp_dir()
+
+        if exit_code == 0 and NEW_URL:
+            print("\n---------------------------------------------------")
+            print("Migracja zakończona!")
+            print(f"Docelowa strona powinna teraz działać pod adresem: {NEW_URL}")
+            print("Pamiętaj o ręcznym sprawdzeniu strony i logów serwera!")
+            print("---------------------------------------------------")
+        elif exit_code == 0:
+            print("\n---------------------------------------------------")
+            print("Migracja zakończona (lub anulowana/błąd przed pobraniem URL).")
+            print("---------------------------------------------------")
+
+        sys.exit(exit_code)
+
+if __name__ == "__main__":
+    main()
