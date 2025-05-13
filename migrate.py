@@ -10,8 +10,8 @@ import time
 import math # Do wskaźnika postępu
 import argparse
 import re # Do operacji na stringach (regex)
-import pwd # Do weryfikacji właściciela (choć teraz mniej potrzebne)
-import grp # Do weryfikacji grupy (choć teraz mniej potrzebne)
+import pwd # Do weryfikacji właściciela
+import grp # Do weryfikacji grupy
 import stat # Do chmod
 
 # --- Konfiguracja ---
@@ -26,15 +26,14 @@ FULL_FINAL_ZIP_PATH = os.path.join(FULL_TEMP_DIR, FINAL_ZIP_FILE)
 CHUNK_SIZE = 5242880 # 5MB
 WP_CLI_BIN = "wp" # Domyślna nazwa, zostanie zweryfikowana i potencjalnie zaktualizowana w main()
 WP_CLI_FLAGS = ["--allow-root"]
-WEB_USER = "www-data" # Nadal może być potrzebne dla skryptu sh, jeśli go używa
-WEB_GROUP = "www-data" # Nadal może być potrzebne dla skryptu sh, jeśli go używa
+WEB_USER = "www-data" 
+WEB_GROUP = "www-data" 
 FIX_PERMISSIONS_SCRIPT_URL = "https://raw.githubusercontent.com/TheBlackSurf/kody/refs/heads/main/fix_wp_chmod.sh"
 FIX_PERMISSIONS_SCRIPT_NAME = "fix_wp_chmod_temp.sh" # Tymczasowa nazwa pliku
 
 # --- Funkcje pomocnicze ---
 
 def run_command(command, check=True, **kwargs):
-    # Upewnij się, że command jest listą stringów
     if isinstance(command, str):
         command_list = command.split()
         print(f"Ostrzeżenie: run_command otrzymał string, konwertuję na listę: {command_list}", file=sys.stderr)
@@ -60,7 +59,7 @@ def run_command(command, check=True, **kwargs):
             stderr_output = result.stderr.strip() if result.stderr else ""
             stdout_output = result.stdout.strip() if result.stdout else ""
 
-            is_search_replace_no_change = (
+            is_search_replace_no_change = ( # Ta sekcja nie będzie już używana dla search-replace
                 len(command_list) > 2 and
                 command_list[1:3] == ["search-replace", command_list[2]] and
                 ("No tables found to replace" in stderr_output or "No values changed" in stderr_output or "0 replacements" in stdout_output)
@@ -74,9 +73,13 @@ def run_command(command, check=True, **kwargs):
                 result.stderr and ("does not exist" in result.stderr.lower() or "isn't an object cache" in result.stderr.lower())
             )
             is_external_script_run = (len(command_list) == 1 and command_list[0].endswith(FIX_PERMISSIONS_SCRIPT_NAME))
+            is_option_update_no_change = ( # Dla wp option update, gdy wartość jest taka sama
+                len(command_list) > 2 and command_list[1] == "option" and command_list[2] == "update" and
+                ("Success: Value passed for" in stdout_output and "is already" in stdout_output)
+            )
 
 
-            if not (is_search_replace_no_change or is_db_create_exists or is_cache_flush_not_found or is_external_script_run):
+            if not (is_search_replace_no_change or is_db_create_exists or is_cache_flush_not_found or is_external_script_run or is_option_update_no_change):
                  print(f"Ostrzeżenie: Komenda '{' '.join(command_list)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
                  if stdout_output: print(f"Stdout (Ostrzeżenie):\n{stdout_output}", file=sys.stderr)
                  if stderr_output: print(f"Stderr (Ostrzeżenie):\n{stderr_output}", file=sys.stderr)
@@ -86,6 +89,8 @@ def run_command(command, check=True, **kwargs):
                 print(f"  Informacja: Baza danych już istniała (komunikat od 'wp db create').")
             elif is_cache_flush_not_found:
                 print(f"  Informacja: Nie znaleziono obiektu cache do wyczyszczenia lub mechanizm nie jest aktywny.")
+            elif is_option_update_no_change:
+                print(f"  Informacja: Opcja '{command_list[3]}' miała już ustawioną wartość '{command_list[4]}'.")
             elif is_external_script_run and result.returncode != 0:
                  print(f"Ostrzeżenie: Zewnętrzny skrypt '{command_list[0]}' zwrócił kod wyjścia {result.returncode}", file=sys.stderr)
                  if stdout_output: print(f"Stdout (Skrypt Zewnętrzny):\n{stdout_output}", file=sys.stderr)
@@ -400,20 +405,47 @@ def main():
             else:
                 print(f"Ostrzeżenie: Nie udało się odczytać prefixu tabeli z {backup_wp_config_path} (z backupu). Zakładam, że obecny prefix w {target_wp_config_path} jest poprawny.", file=sys.stderr)
 
-        print(f"\nAktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}'...")
-        search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
-        search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
-        normalized_source_domain = SOURCE_DOMAIN.replace("www.", "")
-        urls_to_replace = sorted(list(set([
-            f"http://{normalized_source_domain}", f"https://{normalized_source_domain}",
-            f"http://www.{normalized_source_domain}", f"https://www.{normalized_source_domain}"
-        ])))
-        for old_url in urls_to_replace:
-            print(f"  Zamiana: '{old_url}' -> '{NEW_URL}'")
-            run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
-        print("Wyszukiwanie i zamiana URL-i w bazie danych zakończona.")
+        # --- ZMODYFIKOWANA SEKCJA AKTUALIZACJI URL ---
+        # Usuwamy ogólne wp search-replace, aby zminimalizować ryzyko uszkodzenia danych.
+        # Zamiast tego, aktualizujemy tylko kluczowe opcje 'siteurl' i 'home'.
+        # Użytkownik będzie musiał ręcznie zaktualizować pozostałe URL-e (np. w treści)
+        # za pomocą wtyczki takiej jak "Better Search Replace" po zalogowaniu się do panelu.
+        
+        print(f"\nAktualizacja kluczowych opcji WordPressa: 'siteurl' i 'home' na '{NEW_URL}'...")
+        
+        # Upewnij się, że jesteśmy w WP_ROOT_DIR
+        if os.getcwd() != WP_ROOT_DIR:
+            print(f"Zmieniam katalog roboczy na {WP_ROOT_DIR} przed aktualizacją opcji.")
+            os.chdir(WP_ROOT_DIR)
 
-        print("Rozpoczęcie migracji plików...")
+        # Aktualizacja 'siteurl'
+        result_update_siteurl = run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
+        if result_update_siteurl is None or result_update_siteurl.returncode != 0:
+            # Sprawdzamy, czy błąd nie wynika z tego, że wartość jest już ustawiona
+            if not (result_update_siteurl and result_update_siteurl.stdout and "Success: Value passed for 'siteurl' is already" in result_update_siteurl.stdout):
+                print(f"Ostrzeżenie: Nie udało się zaktualizować opcji 'siteurl' na '{NEW_URL}'. Strona może nie działać poprawnie.", file=sys.stderr)
+                if result_update_siteurl and result_update_siteurl.stderr: print(f"Stderr (update siteurl): {result_update_siteurl.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  Opcja 'siteurl' zaktualizowana na '{NEW_URL}' (lub była już poprawna).")
+
+        # Aktualizacja 'home'
+        result_update_home = run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
+        if result_update_home is None or result_update_home.returncode != 0:
+            if not (result_update_home and result_update_home.stdout and "Success: Value passed for 'home' is already" in result_update_home.stdout):
+                print(f"Ostrzeżenie: Nie udało się zaktualizować opcji 'home' na '{NEW_URL}'. Strona może nie działać poprawnie.", file=sys.stderr)
+                if result_update_home and result_update_home.stderr: print(f"Stderr (update home): {result_update_home.stderr.strip()}", file=sys.stderr)
+        else:
+            print(f"  Opcja 'home' zaktualizowana na '{NEW_URL}' (lub była już poprawna).")
+        
+        print("Kluczowe opcje 'siteurl' i 'home' zaktualizowane.")
+        print("WAŻNE: Ogólne wyszukiwanie i zamiana URL-i w bazie danych NIE zostało wykonane automatycznie.")
+        print(f"       Należy ręcznie sprawdzić i zaktualizować pozostałe wystąpienia starego URL ('{SOURCE_DOMAIN}')")
+        print(f"       na nowy URL ('{NEW_URL}') w treściach postów, ustawieniach wtyczek itp.,")
+        print("       najlepiej za pomocą wtyczki 'Better Search Replace' po zalogowaniu się do panelu admina.")
+        # --- KONIEC ZMODYFIKOWANEJ SEKCJI AKTUALIZACJI URL ---
+
+
+        print("\nRozpoczęcie migracji plików...")
         print(f"Zachowywanie docelowego wp-config.php (z potencjalnie zaktualizowanym prefixem) do {FULL_TEMP_WP_CONFIG_PATH}...")
         if not os.path.exists(target_wp_config_path): 
             raise Exception(f"Nie znaleziono docelowego wp-config.php w {target_wp_config_path}!")
@@ -460,7 +492,7 @@ def main():
         shutil.copy2(FULL_TEMP_WP_CONFIG_PATH, target_wp_config_path) 
         print(f"Plik wp-config.php przywrócony do {target_wp_config_path}.")
 
-        # Operacje WP-CLI przed skryptem uprawnień
+        # Operacje WP-CLI 
         print("\nWykonywanie końcowych operacji WP-CLI (przed skryptem uprawnień)...")
         if os.getcwd() != WP_ROOT_DIR: 
             os.chdir(WP_ROOT_DIR)
@@ -468,10 +500,11 @@ def main():
         print("Odświeżanie permanentnych linków...")
         run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False) 
 
-        print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL} (dodatkowe upewnienie)...")
-        run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
-        run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
-        print("'siteurl' i 'home' zaktualizowane.")
+        # Aktualizacja siteurl i home została już wykonana wcześniej w dedykowanej sekcji
+        # print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL} (dodatkowe upewnienie)...")
+        # run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
+        # run_command([WP_CLI_BIN, "option", "update", "home", NEW_URL] + WP_CLI_FLAGS, check=False)
+        # print("'siteurl' i 'home' zaktualizowane.")
 
         print("Pominięto automatyczną aktualizację rdzenia, wtyczek i motywów.")
 
@@ -517,7 +550,6 @@ def main():
                 else:
                     print("  Skrypt uprawnień wykonany.")
 
-            # Usuwanie skryptu niezależnie od tego czy chmod/run się powiódł, o ile został pobrany
             print(f"-> Krok 4: Usuwanie tymczasowego skryptu '{fix_permissions_script_path}'...")
             if os.path.exists(fix_permissions_script_path):
                 try:
@@ -537,7 +569,7 @@ def main():
         traceback.print_exc(file=sys.stderr) 
         exit_code = 1
     finally:
-        if os.path.exists(fix_permissions_script_path): # Dodatkowe sprzątanie na wszelki wypadek
+        if os.path.exists(fix_permissions_script_path): 
              print(f"Sprzątanie (finally): Usuwanie tymczasowego skryptu '{fix_permissions_script_path}'...")
              try: os.remove(fix_permissions_script_path)
              except OSError as e: print(f"Ostrzeżenie (finally): Nie udało się usunąć '{fix_permissions_script_path}': {e}", file=sys.stderr)
@@ -553,9 +585,11 @@ def main():
             print("\n---------------------------------------------------")
             print("Migracja zakończona pomyślnie!")
             print(f"Docelowa strona powinna teraz działać pod adresem: {NEW_URL}")
-            print(f"Skrypt WYKONAŁ automatyczne wyszukiwanie i zamianę URL-i.")
+            print("Kluczowe opcje 'siteurl' i 'home' zostały zaktualizowane.")
+            print("WAŻNE: Ogólne wyszukiwanie i zamiana pozostałych URL-i w bazie danych NIE zostało wykonane automatycznie.")
+            print(f"       Należy ręcznie sprawdzić i zaktualizować wystąpienia starego URL ('{SOURCE_DOMAIN}') na nowy ('{NEW_URL}')")
+            print("       w treściach postów, ustawieniach wtyczek itp., najlepiej za pomocą wtyczki 'Better Search Replace'.")
             print("Uprawnienia plików zostały ustawione za pomocą zewnętrznego skryptu.")
-            print(f"Właściciel dla plików/katalogów powinien być ustawiony zgodnie z logiką skryptu {FIX_PERMISSIONS_SCRIPT_NAME}.")
             print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera!")
             print("---------------------------------------------------")
         elif exit_code == 0:
