@@ -10,6 +10,8 @@ import time
 import math # Do wskaźnika postępu
 import argparse
 import re # Do operacji na stringach (regex)
+import pwd # Do weryfikacji właściciela
+import grp # Do weryfikacji grupy
 
 # --- Konfiguracja ---
 WP_ROOT_DIR = "/var/www/html/wp"
@@ -305,9 +307,6 @@ def main():
 
         if result_unzip is None or result_unzip.returncode != 0:
             raise Exception(f"Błąd rozpakowywania pliku {FINAL_ZIP_FILE}.")
-        # Komenda unzip -qq nie zwraca normalnie stdout, chyba że jest błąd.
-        # if result_unzip.stdout and result_unzip.stdout.strip():
-        #      print(f"Wynik unzip:\n{result_unzip.stdout.strip()}")
         print("Backup rozpakowany.")
 
         print("Identyfikacja plików backupu...")
@@ -333,13 +332,11 @@ def main():
         print(f"Docelowy URL strony (nowy): {NEW_URL}")
 
         print(f"Krok 1 DB: Wstępne sprawdzanie/tworzenie bazy danych (jeśli nie istnieje)...")
-        # check=False, bo "database exists" to nie błąd tutaj
         result_db_create_initial = run_command([WP_CLI_BIN, "db", "create"] + WP_CLI_FLAGS, check=False)
         if result_db_create_initial is not None:
             if result_db_create_initial.returncode == 0: print("Baza danych utworzona lub potwierdzono istnienie (kod 0).")
             elif result_db_create_initial.stderr and "database exists" in result_db_create_initial.stderr.lower(): print("Baza danych już istniała (komunikat od MySQL).")
             else:
-                 # Jeśli nie było "database exists" a kod > 0, to jest problem
                  raise Exception(f"Początkowe 'wp db create' nie powiodło się z nieoczekiwanym błędem (kod: {result_db_create_initial.returncode}). stderr: {result_db_create_initial.stderr}")
         else:
             raise Exception(f"Krytyczny błąd systemowy podczas początkowego 'wp db create'.")
@@ -369,10 +366,9 @@ def main():
             raise Exception(f"Nie udało się zaimportować bazy danych ('wp db import {SQL_FILE_PATH}'). stderr: {result_db_import.stderr if result_db_import else ''}")
         print("Baza danych zaimportowana.")
 
-        # --- AKTUALIZACJA PREFIXU TABELI W wp-config.php ---
         print("\nSprawdzanie i aktualizacja prefixu tabel w wp-config.php...")
-        backup_wp_config_path = os.path.join(FULL_TEMP_DIR, "wp-config.php") # Ścieżka do wp-config.php z backupu
-        target_wp_config_path = WP_CONFIG_DEST_PATH_IN_ROOT     # Ścieżka do wp-config.php w docelowej instalacji
+        backup_wp_config_path = os.path.join(FULL_TEMP_DIR, "wp-config.php") 
+        target_wp_config_path = WP_CONFIG_DEST_PATH_IN_ROOT     
 
         if not os.path.exists(backup_wp_config_path):
             print(f"Ostrzeżenie: Nie znaleziono pliku wp-config.php w backupie ({backup_wp_config_path}). Nie można automatycznie zaktualizować prefixu tabel. Zakładam, że obecny prefix w {target_wp_config_path} jest poprawny.", file=sys.stderr)
@@ -393,21 +389,17 @@ def main():
                     print("Prefix tabeli w docelowym wp-config.php jest już zgodny z backupem.")
             else:
                 print(f"Ostrzeżenie: Nie udało się odczytać prefixu tabeli z {backup_wp_config_path} (z backupu). Zakładam, że obecny prefix w {target_wp_config_path} jest poprawny.", file=sys.stderr)
-        # --- KONIEC AKTUALIZACJI PREFIXU ---
 
-        # --- WP SEARCH-REPLACE ---
         print(f"\nAktualizacja URL-i w bazie danych: zamiana '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}'...")
         search_replace_base_cmd = [WP_CLI_BIN, "search-replace"]
         search_replace_options = ["--all-tables-with-prefix", "--recurse-objects", "--skip-columns=guid", "--precise", "--report-changed-only"] + WP_CLI_FLAGS
         
-        # Normalizujemy SOURCE_DOMAIN do postaci bez www na potrzeby porównań, ale zamieniamy z www i bez
         normalized_source_domain = SOURCE_DOMAIN.replace("www.", "")
         
         urls_to_replace = [
             f"http://{normalized_source_domain}", f"https://{normalized_source_domain}",
             f"http://www.{normalized_source_domain}", f"https://www.{normalized_source_domain}"
         ]
-        # Usuń duplikaty jeśli SOURCE_DOMAIN już zawierało www.
         urls_to_replace = sorted(list(set(urls_to_replace)))
 
 
@@ -416,12 +408,10 @@ def main():
             run_command(search_replace_base_cmd + [old_url, NEW_URL] + search_replace_options, check=False)
 
         print("Wyszukiwanie i zamiana URL-i w bazie danych zakończona.")
-        # --- KONIEC WP SEARCH-REPLACE ---
-
 
         print("Rozpoczęcie migracji plików...")
         print(f"Zachowywanie docelowego wp-config.php (z potencjalnie zaktualizowanym prefixem) do {FULL_TEMP_WP_CONFIG_PATH}...")
-        if not os.path.exists(target_wp_config_path): # Używamy target_wp_config_path zamiast WP_CONFIG_DEST_PATH_IN_ROOT dla spójności
+        if not os.path.exists(target_wp_config_path): 
             raise Exception(f"Nie znaleziono docelowego wp-config.php w {target_wp_config_path}!")
         shutil.copy2(target_wp_config_path, FULL_TEMP_WP_CONFIG_PATH)
         print("Docelowy wp-config.php zachowany w katalogu tymczasowym.")
@@ -431,19 +421,18 @@ def main():
         if os.path.isdir(target_wp_content_full_path):
             shutil.rmtree(target_wp_content_full_path)
             print(f"Katalog {target_wp_content_full_path} usunięty.")
-        elif os.path.exists(target_wp_content_full_path): # Jeśli to plik, a nie katalog
+        elif os.path.exists(target_wp_content_full_path): 
              os.remove(target_wp_content_full_path)
              print(f"Plik {target_wp_content_full_path} (oczekiwano katalogu) usunięty.")
         else:
             print(f"Katalog {target_wp_content_full_path} nie istniał.")
 
         print(f"Przenoszenie zawartości z backupu ({FULL_TEMP_DIR}) do {WP_ROOT_DIR}...")
-        # Elementy do wykluczenia z przenoszenia z katalogu tymczasowego do WP_ROOT_DIR
         items_to_exclude_from_move = [
-            os.path.basename(SQL_FILE_PATH),        # np. database_xxxx.sql
-            FINAL_ZIP_FILE,                         # np. backup_finalny.zip
-            os.path.basename(FULL_TEMP_WP_CONFIG_PATH), # np. wp-config.php.original_target
-            "wp-config.php" # Plik wp-config.php z backupu (nie chcemy go nadpisywać nad naszym zachowanym)
+            os.path.basename(SQL_FILE_PATH),       
+            FINAL_ZIP_FILE,                        
+            os.path.basename(FULL_TEMP_WP_CONFIG_PATH), 
+            "wp-config.php" 
         ]
         moved_items_count = 0
         for item_name in os.listdir(FULL_TEMP_DIR):
@@ -451,7 +440,6 @@ def main():
                 source_item_path = os.path.join(FULL_TEMP_DIR, item_name)
                 destination_item_path = os.path.join(WP_ROOT_DIR, item_name)
 
-                # Jeśli element docelowy istnieje, usuń go przed przeniesieniem, aby uniknąć błędów (np. przy przenoszeniu katalogu na plik)
                 if os.path.exists(destination_item_path):
                     print(f"Ostrzeżenie: Element docelowy {destination_item_path} istnieje. Zostanie usunięty i nadpisany przez element z backupu.")
                     if os.path.isdir(destination_item_path):
@@ -459,35 +447,91 @@ def main():
                     else:
                         os.remove(destination_item_path)
                 
-                # Użyj shutil.move, aby przenieść
                 shutil.move(source_item_path, destination_item_path)
                 moved_items_count +=1
                 print(f"Przeniesiono: {item_name} z {source_item_path} do {destination_item_path}")
 
         if moved_items_count == 0 :
-             print("Ostrzeżenie: Nie przeniesiono żadnych głównych elementów z katalogu backupu (np. wp-content). Sprawdź strukturę backupu w {FULL_TEMP_DIR}.")
+             print(f"Ostrzeżenie: Nie przeniesiono żadnych głównych elementów z katalogu backupu (np. wp-content). Sprawdź strukturę backupu w {FULL_TEMP_DIR}.")
         print("Pliki/katalogi z backupu przeniesione.")
 
         print(f"Przywracanie oryginalnego (ale zaktualizowanego o prefix) wp-config.php z {FULL_TEMP_WP_CONFIG_PATH} do {target_wp_config_path}...")
-        shutil.copy2(FULL_TEMP_WP_CONFIG_PATH, target_wp_config_path) # Kopiujemy zachowany plik z powrotem
+        shutil.copy2(FULL_TEMP_WP_CONFIG_PATH, target_wp_config_path) 
         print(f"Plik wp-config.php przywrócony do {target_wp_config_path}.")
 
+        # --- POCZĄTEK ZMODYFIKOWANEJ SEKCJI USTAWIANIA UPRAWNIEŃ ---
+        print(f"\nUstawianie uprawnień plików w {WP_ROOT_DIR}...")
+        # Upewnij się, że jesteśmy w WP_ROOT_DIR dla komend
+        # Skrypt już powinien być w WP_ROOT_DIR po wcześniejszych operacjach, ale dla pewności:
+        if os.getcwd() != WP_ROOT_DIR:
+            print(f"Zmieniam katalog roboczy na {WP_ROOT_DIR} przed ustawieniem uprawnień.")
+            os.chdir(WP_ROOT_DIR)
 
-        print(f"Ustawianie uprawnień plików w {WP_ROOT_DIR}...")
-        # Upewnij się, że jesteśmy w WP_ROOT_DIR dla komend find
-        os.chdir(WP_ROOT_DIR)
-        run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", "."], check=False) # check=False na wypadek problemów z niektórymi plikami
-        run_command(["find", ".", "-type", "d", "-exec", "chmod", "755", "{}", "+"], check=False)
-        run_command(["find", ".", "-type", "f", "-exec", "chmod", "644", "{}", "+"], check=False)
-        if os.path.exists("wp-config.php"):
-            run_command(["chmod", "640", "wp-config.php"], check=False) # Bardziej restrykcyjne dla wp-config
-        print("Uprawnienia plików ustawione (mogły wystąpić ostrzeżenia, jeśli niektóre pliki miały specjalne uprawnienia).")
+        print(f"-> Krok 1: Ustawianie właściciela na {WEB_USER}:{WEB_GROUP} dla całego katalogu '{WP_ROOT_DIR}'...")
+        # Używamy ścieżki bezwzględnej dla większej pewności
+        result_chown_all = run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", WP_ROOT_DIR], check=False)
+        if result_chown_all is not None and result_chown_all.returncode != 0:
+             print(f"Ostrzeżenie: Główna komenda chown dla '{WP_ROOT_DIR}' zwróciła kod {result_chown_all.returncode}. Mogą wystąpić problemy z uprawnieniami.", file=sys.stderr)
+             if result_chown_all.stderr: print(f"Stderr (chown all): {result_chown_all.stderr.strip()}", file=sys.stderr)
 
-        print("Wykonywanie końcowych operacji WP-CLI...")
+        # Dodatkowy, jawny chown dla wp-content i jego zawartości, na wszelki wypadek
+        # Ścieżka wp_content_full_path została już zdefiniowana wcześniej
+        if os.path.exists(target_wp_content_full_path): # Używamy target_wp_content_full_path
+             print(f"-> Krok 2: Dodatkowe, jawne ustawianie właściciela dla '{target_wp_content_full_path}'...")
+             result_chown_content = run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", target_wp_content_full_path], check=False)
+             if result_chown_content is not None and result_chown_content.returncode != 0:
+                  print(f"Ostrzeżenie: Dodatkowa komenda chown dla '{target_wp_content_full_path}' zwróciła kod {result_chown_content.returncode}.", file=sys.stderr)
+                  if result_chown_content.stderr: print(f"Stderr (chown wp-content): {result_chown_content.stderr.strip()}", file=sys.stderr)
+        else:
+             print(f"Ostrzeżenie: Katalog '{target_wp_content_full_path}' nie istnieje, pomijam dodatkowy chown.", file=sys.stderr)
+
+
+        print(f"-> Krok 3: Ustawianie uprawnień dla katalogów (755) w '{WP_ROOT_DIR}'...")
+        # Używamy find ze ścieżką bezwzględną
+        run_command(["find", WP_ROOT_DIR, "-type", "d", "-exec", "chmod", "755", "{}", "+"], check=False)
+
+        print(f"-> Krok 4: Ustawianie uprawnień dla plików (644) w '{WP_ROOT_DIR}'...")
+        run_command(["find", WP_ROOT_DIR, "-type", "f", "-exec", "chmod", "644", "{}", "+"], check=False)
+
+        # Specjalne uprawnienia dla wp-config.php
+        wp_config_full_path = os.path.join(WP_ROOT_DIR, "wp-config.php")
+        if os.path.exists(wp_config_full_path):
+            print(f"-> Krok 5: Ustawianie uprawnień dla '{wp_config_full_path}' (640)...")
+            run_command(["chmod", "640", wp_config_full_path], check=False)
+
+        print("Ustawianie podstawowych uprawnień zakończone (sprawdź logi pod kątem ostrzeżeń).")
+
+        # Opcjonalny krok weryfikacji właściciela wp-content
+        print(f"-> Krok 6: Weryfikacja właściciela '{target_wp_content_full_path}'...")
+        try:
+             # Sprawdzamy ścieżkę bezwzględną
+             if os.path.exists(target_wp_content_full_path):
+                 stat_info = os.stat(target_wp_content_full_path)
+                 uid = stat_info.st_uid
+                 gid = stat_info.st_gid
+                 # Moduły pwd i grp są importowane na początku skryptu
+                 owner_name = pwd.getpwuid(uid).pw_name
+                 group_name = grp.getgrgid(gid).gr_name
+                 print(f"  Aktualny właściciel '{target_wp_content_full_path}': {owner_name}:{group_name}")
+                 if owner_name != WEB_USER or group_name != WEB_GROUP:
+                      print(f"  KRYTYCZNE OSTRZEŻENIE: Właściciel '{target_wp_content_full_path}' to {owner_name}:{group_name}, ale oczekiwano {WEB_USER}:{WEB_GROUP}! Komenda 'chown' mogła nie zadziałać poprawnie.", file=sys.stderr)
+                 else:
+                      print(f"  Weryfikacja właściciela '{target_wp_content_full_path}' OK.")
+             else:
+                 print(f"  Ostrzeżenie: Nie można zweryfikować właściciela, katalog '{target_wp_content_full_path}' nie istnieje.", file=sys.stderr)
+        except ImportError:
+             print("  Ostrzeżenie: Nie można zaimportować modułów pwd/grp do weryfikacji właściciela (może nie być dostępne w tym systemie).", file=sys.stderr)
+        except Exception as e:
+             print(f"  Ostrzeżenie: Wystąpił błąd podczas weryfikacji właściciela '{target_wp_content_full_path}': {e}", file=sys.stderr)
+        # --- KONIEC ZMODYFIKOWANEJ SEKCJI USTAWIANIA UPRAWNIEŃ ---
+
+        print("\nWykonywanie końcowych operacji WP-CLI...")
         # Upewnij się, że jesteśmy w WP_ROOT_DIR
-        os.chdir(WP_ROOT_DIR)
+        if os.getcwd() != WP_ROOT_DIR: # Ponowne sprawdzenie, na wszelki wypadek
+            os.chdir(WP_ROOT_DIR)
+
         print("Odświeżanie permanentnych linków...")
-        run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False) # check=False, bo to czasem zawodzi na świeżych instalacjach
+        run_command([WP_CLI_BIN, "rewrite", "flush", "--hard"] + WP_CLI_FLAGS, check=False) 
 
         print(f"Aktualizacja opcji 'siteurl' i 'home' do {NEW_URL} (dodatkowe upewnienie)...")
         run_command([WP_CLI_BIN, "option", "update", "siteurl", NEW_URL] + WP_CLI_FLAGS, check=False)
@@ -495,22 +539,15 @@ def main():
         print("'siteurl' i 'home' zaktualizowane.")
 
         print("Pominięto automatyczną aktualizację rdzenia, wtyczek i motywów.")
-        # print("Aktualizacja rdzenia WordPressa...")
-        # run_command([WP_CLI_BIN, "core", "update"] + WP_CLI_FLAGS, check=False)
-        # print("Aktualizacja wtyczek...")
-        # run_command([WP_CLI_BIN, "plugin", "update", "--all"] + WP_CLI_FLAGS, check=False)
-        # print("Aktualizacja motywów...")
-        # run_command([WP_CLI_BIN, "theme", "update", "--all"] + WP_CLI_FLAGS, check=False)
-
 
         print("Czyszczenie cache WP (jeśli wspierane)...")
-        run_command([WP_CLI_BIN, "cache", "flush"] + WP_CLI_FLAGS, check=False) # check=False, bo nie każdy WP ma aktywny cache
+        run_command([WP_CLI_BIN, "cache", "flush"] + WP_CLI_FLAGS, check=False) 
         print("Operacje WP-CLI zakończone.")
 
     except Exception as e:
         print(f"KRYTYCZNY BŁĄD SKRYPTU: {e}", file=sys.stderr)
         import traceback
-        traceback.print_exc(file=sys.stderr) # Dodatkowy traceback dla debugowania
+        traceback.print_exc(file=sys.stderr) 
         exit_code = 1
     finally:
         if exit_code != 0:
@@ -527,18 +564,18 @@ def main():
             print(f"Skrypt WYKONAŁ automatyczne wyszukiwanie i zamianę URL-i")
             print(f"(z '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}') we wszystkich tabelach z prefixem.")
             print("Operacja wp search-replace została przeprowadzona z opcjami: --all-tables-with-prefix --recurse-objects --skip-columns=guid --precise --report-changed-only")
-            print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera!")
+            print("Skrypt próbował również ustawić poprawne uprawnienia plików i katalogów.")
+            print(f"Właściciel dla plików/katalogów powinien być ustawiony na {WEB_USER}:{WEB_GROUP}.")
+            print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera, w tym uprawnień plików!")
             print("---------------------------------------------------")
         elif exit_code == 0:
             print("\n---------------------------------------------------")
             print("Migracja zakończona (ale NEW_URL nie został ustalony - sprawdź logi).")
-            print("Sprawdź logi powyżej pod kątem ewentualnych ostrzeżeń lub błędów.")
+            print("Sprawdź logi powyżej pod kątem ewentualnych ostrzeżeń lub błędów, w tym dotyczących uprawnień.")
             print("---------------------------------------------------")
 
 
         sys.exit(exit_code)
 
 if __name__ == "__main__":
-    # Upewnij się, że WP_CLI_BIN jest globalne i może być modyfikowane
-    # Definicja WP_CLI_BIN jest już na poziomie globalnym, main() ją modyfikuje
     main()
