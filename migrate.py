@@ -10,8 +10,9 @@ import time
 import math # Do wskaźnika postępu
 import argparse
 import re # Do operacji na stringach (regex)
-import pwd # Do weryfikacji właściciela
-import grp # Do weryfikacji grupy
+import pwd # Do weryfikacji właściciela (choć teraz mniej potrzebne)
+import grp # Do weryfikacji grupy (choć teraz mniej potrzebne)
+import stat # Do chmod
 
 # --- Konfiguracja ---
 WP_ROOT_DIR = "/var/www/html/wp"
@@ -25,13 +26,25 @@ FULL_FINAL_ZIP_PATH = os.path.join(FULL_TEMP_DIR, FINAL_ZIP_FILE)
 CHUNK_SIZE = 5242880 # 5MB
 WP_CLI_BIN = "wp" # Domyślna nazwa, zostanie zweryfikowana i potencjalnie zaktualizowana w main()
 WP_CLI_FLAGS = ["--allow-root"]
-WEB_USER = "www-data"
-WEB_GROUP = "www-data"
+WEB_USER = "www-data" # Nadal może być potrzebne dla skryptu sh, jeśli go używa
+WEB_GROUP = "www-data" # Nadal może być potrzebne dla skryptu sh, jeśli go używa
+FIX_PERMISSIONS_SCRIPT_URL = "https://raw.githubusercontent.com/TheBlackSurf/kody/refs/heads/main/fix_wp_chmod.sh"
+FIX_PERMISSIONS_SCRIPT_NAME = "fix_wp_chmod_temp.sh" # Tymczasowa nazwa pliku
 
 # --- Funkcje pomocnicze ---
 
 def run_command(command, check=True, **kwargs):
-    print(f"-> Uruchamiam: {' '.join(command)}")
+    # Upewnij się, że command jest listą stringów
+    if isinstance(command, str):
+        # Proste rozdzielenie po spacjach, może wymagać poprawy dla bardziej złożonych komend
+        command_list = command.split()
+        print(f"Ostrzeżenie: run_command otrzymał string, konwertuję na listę: {command_list}", file=sys.stderr)
+    elif isinstance(command, list):
+        command_list = command
+    else:
+        raise TypeError(f"Nieprawidłowy typ dla 'command' w run_command: {type(command)}")
+
+    print(f"-> Uruchamiam: {' '.join(command_list)}")
     effective_kwargs = kwargs.copy()
     if 'capture_output' not in effective_kwargs:
         effective_kwargs['capture_output'] = True
@@ -39,53 +52,72 @@ def run_command(command, check=True, **kwargs):
         effective_kwargs['text'] = True
     original_check = check
     try:
-        result = subprocess.run(command, check=False, **effective_kwargs)
+        # Używamy command_list do wykonania
+        result = subprocess.run(command_list, check=False, **effective_kwargs)
         if original_check and result.returncode != 0:
             raise subprocess.CalledProcessError(
-                result.returncode, command, output=result.stdout, stderr=result.stderr
+                result.returncode, command_list, output=result.stdout, stderr=result.stderr
             )
         if not original_check and result.returncode != 0:
             stderr_output = result.stderr.strip() if result.stderr else ""
             stdout_output = result.stdout.strip() if result.stdout else ""
 
             is_search_replace_no_change = (
-                len(command) > 2 and # Upewnij się, że command ma wystarczająco dużo elementów
-                command[1:3] == ["search-replace", command[2]] and
+                len(command_list) > 2 and # Upewnij się, że command ma wystarczająco dużo elementów
+                command_list[1:3] == ["search-replace", command_list[2]] and
                 ("No tables found to replace" in stderr_output or "No values changed" in stderr_output or "0 replacements" in stdout_output) # Dodano "0 replacements"
             )
             is_db_create_exists = (
-                len(command) > 2 and command[1:2] == ["db"] and command[2] in ["create"] and
+                len(command_list) > 2 and command_list[1:2] == ["db"] and command_list[2] in ["create"] and
                 result.stderr and "database exists" in result.stderr.lower()
             )
             is_cache_flush_not_found = (
-                len(command) > 1 and command[1:3] == ["cache", "flush"] and
+                len(command_list) > 1 and command_list[1:3] == ["cache", "flush"] and
                 result.stderr and ("does not exist" in result.stderr.lower() or "isn't an object cache" in result.stderr.lower()) # Błąd, gdy nie ma cache do wyczyszczenia
             )
+            # Dodajemy warunek dla uruchomienia skryptu powłoki, aby nie traktować jego komunikatów jako błędów Pythona
+            is_external_script_run = (len(command_list) == 1 and command_list[0].endswith(FIX_PERMISSIONS_SCRIPT_NAME))
 
 
-            if not (is_search_replace_no_change or is_db_create_exists or is_cache_flush_not_found):
-                 print(f"Ostrzeżenie: Komenda '{' '.join(command)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
+            if not (is_search_replace_no_change or is_db_create_exists or is_cache_flush_not_found or is_external_script_run):
+                 print(f"Ostrzeżenie: Komenda '{' '.join(command_list)}' zwróciła kod wyjścia {result.returncode}", file=sys.stderr)
                  if stdout_output: print(f"Stdout (Ostrzeżenie):\n{stdout_output}", file=sys.stderr)
                  if stderr_output: print(f"Stderr (Ostrzeżenie):\n{stderr_output}", file=sys.stderr)
             elif is_search_replace_no_change:
-                 print(f"  Komenda '{' '.join(command[:3])}...' zakończona (brak zmian lub brak tabel).")
+                 print(f"  Komenda '{' '.join(command_list[:3])}...' zakończona (brak zmian lub brak tabel).")
             elif is_db_create_exists:
                 print(f"  Informacja: Baza danych już istniała (komunikat od 'wp db create').")
             elif is_cache_flush_not_found:
                 print(f"  Informacja: Nie znaleziono obiektu cache do wyczyszczenia lub mechanizm nie jest aktywny.")
+            elif is_external_script_run and result.returncode != 0:
+                 # Logujemy jako ostrzeżenie, jeśli skrypt zewnętrzny zwrócił błąd
+                 print(f"Ostrzeżenie: Zewnętrzny skrypt '{command_list[0]}' zwrócił kod wyjścia {result.returncode}", file=sys.stderr)
+                 if stdout_output: print(f"Stdout (Skrypt Zewnętrzny):\n{stdout_output}", file=sys.stderr)
+                 if stderr_output: print(f"Stderr (Skrypt Zewnętrzny):\n{stderr_output}", file=sys.stderr)
+            elif is_external_script_run and result.returncode == 0:
+                 # Logujemy stdout/stderr jeśli skrypt coś wypisał, nawet przy sukcesie
+                 print(f"Zewnętrzny skrypt '{command_list[0]}' zakończony pomyślnie (kod 0).")
+                 if stdout_output: print(f"Stdout (Skrypt Zewnętrzny):\n{stdout_output}")
+                 if stderr_output: print(f"Stderr (Skrypt Zewnętrzny):\n{stderr_output}")
 
 
         return result
     except subprocess.CalledProcessError as e:
-        print(f"Błąd: Komenda '{' '.join(command)}' zwróciła kod wyjścia {e.returncode}", file=sys.stderr)
+        print(f"Błąd: Komenda '{' '.join(command_list)}' zwróciła kod wyjścia {e.returncode}", file=sys.stderr)
         if e.stdout and e.stdout.strip(): print(f"Stdout (Błąd):\n{e.stdout.strip()}", file=sys.stderr)
         if e.stderr and e.stderr.strip(): print(f"Stderr (Błąd):\n{e.stderr.strip()}", file=sys.stderr)
         return None
     except FileNotFoundError:
-        print(f"Błąd: Komenda '{command[0]}' nie znaleziona. Sprawdź czy jest zainstalowana i czy jest w PATH.", file=sys.stderr)
+        # Sprawdź, czy to błąd dla WP_CLI_BIN czy dla innego polecenia
+        if command_list[0] == WP_CLI_BIN:
+             print(f"Błąd: Komenda WP-CLI ('{WP_CLI_BIN}') nie znaleziona. Sprawdź instalację i PATH.", file=sys.stderr)
+        elif command_list[0].endswith(FIX_PERMISSIONS_SCRIPT_NAME):
+             print(f"Błąd: Nie można uruchomić pobranego skryptu '{command_list[0]}'. Sprawdź czy został poprawnie pobrany i czy ma uprawnienia.", file=sys.stderr)
+        else:
+             print(f"Błąd: Komenda '{command_list[0]}' nie znaleziona. Sprawdź czy jest zainstalowana i czy jest w PATH.", file=sys.stderr)
         return None
     except PermissionError as e:
-        print(f"Błąd uprawnień podczas próby uruchomienia '{command[0]}': {e}", file=sys.stderr)
+        print(f"Błąd uprawnień podczas próby uruchomienia '{command_list[0]}': {e}", file=sys.stderr)
         return None
     except Exception as e:
         print(f"Wystąpił nieoczekiwany błąd systemowy podczas uruchamiania komendy: {e}", file=sys.stderr)
@@ -176,6 +208,7 @@ def main():
 
     exit_code = 0
     NEW_URL = ""
+    fix_permissions_script_path = os.path.join(WP_ROOT_DIR, FIX_PERMISSIONS_SCRIPT_NAME) # Ścieżka do tymczasowego skryptu
 
     global WP_CLI_BIN # Deklarujemy zamiar modyfikacji globalnej zmiennej
 
@@ -189,6 +222,9 @@ def main():
         print("Sprawdzanie wymaganych narzędzi...")
         if not shutil.which("unzip"):
             raise Exception("Wymagany 'unzip' nie jest zainstalowany.")
+        if not shutil.which("bash"): # Sprawdzamy czy jest bash do uruchomienia skryptu .sh
+             print("Ostrzeżenie: Komenda 'bash' nie znaleziona. Skrypt naprawy uprawnień może nie zadziałać.", file=sys.stderr)
+
 
         # --- Logika znajdowania WP-CLI ---
         wp_cli_initial_name = "wp"
@@ -218,13 +254,11 @@ def main():
                         WP_CLI_BIN = found_wp_cli_path_after_mod
                         print(f"Znaleziono WP-CLI ('{WP_CLI_BIN}') po modyfikacji PATH.")
                     elif os.path.exists(common_direct_path) and os.access(common_direct_path, os.X_OK):
-                        # Fallback jeśli shutil.which nadal nie działa, ale plik istnieje
                         print(f"shutil.which nadal nie znajduje '{wp_cli_initial_name}' po modyfikacji PATH, ale {common_direct_path} istnieje. Używam bezpośredniej ścieżki: {common_direct_path}")
                         WP_CLI_BIN = common_direct_path
                     else:
                         raise Exception(f"WP-CLI ('{wp_cli_initial_name}') nie jest zainstalowane lub nie jest wykonywalne. Próbowano standardowy PATH, bezpośrednią ścieżkę '{common_direct_path}' oraz modyfikację PATH (dodanie '{usr_local_bin_dir}').")
                 else:
-                    # /usr/local/bin był już w PATH, ale shutil.which("wp") zawiódł, a common_direct_path nie istnieje/nie jest wykonywalny
                     raise Exception(f"WP-CLI ('{wp_cli_initial_name}') nie jest zainstalowane lub nie jest wykonywalne. Katalog '{usr_local_bin_dir}' jest w PATH, ale komenda nie została znaleziona, a bezpośrednia ścieżka '{common_direct_path}' nie działa.")
         # --- Koniec logiki znajdowania WP-CLI ---
 
@@ -258,9 +292,11 @@ def main():
         print(f"Wywoływanie backupu na stronie źródłowej: {TRIGGER_ENDPOINT}")
         headers = {"X-API-Key": API_KEY}
         try:
-            trigger_response = requests.post(TRIGGER_ENDPOINT, headers=headers, timeout=60)
-            trigger_response.raise_for_status() # Podniesie wyjątek dla kodów 4xx/5xx
+            trigger_response = requests.post(TRIGGER_ENDPOINT, headers=headers, timeout=120) 
+            trigger_response.raise_for_status() 
             trigger_data = trigger_response.json()
+        except requests.exceptions.Timeout:
+            raise Exception(f"Przekroczono limit czasu (timeout) podczas wywoływania triggera na {TRIGGER_ENDPOINT}. Serwer źródłowy może być przeciążony lub backup trwa zbyt długo.")
         except requests.exceptions.RequestException as e:
             raise Exception(f"Błąd połączenia lub HTTP podczas wywoływania triggera: {e}")
         except json.JSONDecodeError:
@@ -280,7 +316,7 @@ def main():
             print("\nPusty plik utworzony (rozmiar 0).")
         else:
             try:
-                with requests.get(DOWNLOAD_ENDPOINT, headers=headers, stream=True, timeout=300) as r:
+                with requests.get(DOWNLOAD_ENDPOINT, headers=headers, stream=True, timeout=600) as r: 
                     r.raise_for_status()
                     with open(FULL_FINAL_ZIP_PATH, 'wb') as f:
                         for chunk in r.iter_content(chunk_size=CHUNK_SIZE):
@@ -288,6 +324,8 @@ def main():
                             downloaded_size += len(chunk)
                             print_progress(downloaded_size, backup_filesize)
                 print("\nPobieranie zakończone.")
+            except requests.exceptions.Timeout:
+                raise Exception(f"Przekroczono limit czasu (timeout) podczas pobierania pliku z {DOWNLOAD_ENDPOINT}.")
             except requests.exceptions.RequestException as e:
                  raise Exception(f"Błąd połączenia lub HTTP podczas pobierania pliku: {e}")
 
@@ -300,10 +338,10 @@ def main():
         print("Rozpakowywanie backupu...")
         original_cwd_unzip = os.getcwd()
         try:
-            os.chdir(FULL_TEMP_DIR) # Przejdź do katalogu tymczasowego, aby tam rozpakować
-            result_unzip = run_command(["unzip", "-oqq", FINAL_ZIP_FILE]) # -o (overwrite) -qq (quiet)
+            os.chdir(FULL_TEMP_DIR) 
+            result_unzip = run_command(["unzip", "-oqq", FINAL_ZIP_FILE]) 
         finally:
-            os.chdir(original_cwd_unzip) # Wróć do poprzedniego katalogu
+            os.chdir(original_cwd_unzip) 
 
         if result_unzip is None or result_unzip.returncode != 0:
             raise Exception(f"Błąd rozpakowywania pliku {FINAL_ZIP_FILE}.")
@@ -316,7 +354,6 @@ def main():
         SQL_FILE_PATH = os.path.join(FULL_TEMP_DIR, sql_files[0])
         print(f"Znaleziono plik bazy danych: {SQL_FILE_PATH}")
 
-        # Zmiana katalogu roboczego na WP_ROOT_DIR dla komend WP-CLI
         print(f"Ustawiam katalog roboczy na {WP_ROOT_DIR} dla operacji WP-CLI.")
         os.chdir(WP_ROOT_DIR)
 
@@ -459,75 +496,65 @@ def main():
         shutil.copy2(FULL_TEMP_WP_CONFIG_PATH, target_wp_config_path) 
         print(f"Plik wp-config.php przywrócony do {target_wp_config_path}.")
 
-        # --- POCZĄTEK ZMODYFIKOWANEJ SEKCJI USTAWIANIA UPRAWNIEŃ ---
-        print(f"\nUstawianie uprawnień plików w {WP_ROOT_DIR}...")
-        # Upewnij się, że jesteśmy w WP_ROOT_DIR dla komend
-        # Skrypt już powinien być w WP_ROOT_DIR po wcześniejszych operacjach, ale dla pewności:
+        # --- POCZĄTEK SEKCJI USTAWIANIA UPRAWNIEŃ ZA POMOCĄ ZEWNĘTRZNEGO SKRYPTU ---
+        print(f"\nUstawianie uprawnień plików za pomocą zewnętrznego skryptu...")
         if os.getcwd() != WP_ROOT_DIR:
-            print(f"Zmieniam katalog roboczy na {WP_ROOT_DIR} przed ustawieniem uprawnień.")
+            print(f"Zmieniam katalog roboczy na {WP_ROOT_DIR} przed uruchomieniem skryptu uprawnień.")
             os.chdir(WP_ROOT_DIR)
-
-        print(f"-> Krok 1: Ustawianie właściciela na {WEB_USER}:{WEB_GROUP} dla całego katalogu '{WP_ROOT_DIR}'...")
-        # Używamy ścieżki bezwzględnej dla większej pewności
-        result_chown_all = run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", WP_ROOT_DIR], check=False)
-        if result_chown_all is not None and result_chown_all.returncode != 0:
-             print(f"Ostrzeżenie: Główna komenda chown dla '{WP_ROOT_DIR}' zwróciła kod {result_chown_all.returncode}. Mogą wystąpić problemy z uprawnieniami.", file=sys.stderr)
-             if result_chown_all.stderr: print(f"Stderr (chown all): {result_chown_all.stderr.strip()}", file=sys.stderr)
-
-        # Dodatkowy, jawny chown dla wp-content i jego zawartości, na wszelki wypadek
-        # Ścieżka wp_content_full_path została już zdefiniowana wcześniej
-        if os.path.exists(target_wp_content_full_path): # Używamy target_wp_content_full_path
-             print(f"-> Krok 2: Dodatkowe, jawne ustawianie właściciela dla '{target_wp_content_full_path}'...")
-             result_chown_content = run_command(["chown", "-R", f"{WEB_USER}:{WEB_GROUP}", target_wp_content_full_path], check=False)
-             if result_chown_content is not None and result_chown_content.returncode != 0:
-                  print(f"Ostrzeżenie: Dodatkowa komenda chown dla '{target_wp_content_full_path}' zwróciła kod {result_chown_content.returncode}.", file=sys.stderr)
-                  if result_chown_content.stderr: print(f"Stderr (chown wp-content): {result_chown_content.stderr.strip()}", file=sys.stderr)
-        else:
-             print(f"Ostrzeżenie: Katalog '{target_wp_content_full_path}' nie istnieje, pomijam dodatkowy chown.", file=sys.stderr)
-
-
-        print(f"-> Krok 3: Ustawianie uprawnień dla katalogów (755) w '{WP_ROOT_DIR}'...")
-        # Używamy find ze ścieżką bezwzględną
-        run_command(["find", WP_ROOT_DIR, "-type", "d", "-exec", "chmod", "755", "{}", "+"], check=False)
-
-        print(f"-> Krok 4: Ustawianie uprawnień dla plików (644) w '{WP_ROOT_DIR}'...")
-        run_command(["find", WP_ROOT_DIR, "-type", "f", "-exec", "chmod", "644", "{}", "+"], check=False)
-
-        # Specjalne uprawnienia dla wp-config.php
-        wp_config_full_path = os.path.join(WP_ROOT_DIR, "wp-config.php")
-        if os.path.exists(wp_config_full_path):
-            print(f"-> Krok 5: Ustawianie uprawnień dla '{wp_config_full_path}' (640)...")
-            run_command(["chmod", "640", wp_config_full_path], check=False)
-
-        print("Ustawianie podstawowych uprawnień zakończone (sprawdź logi pod kątem ostrzeżeń).")
-
-        # Opcjonalny krok weryfikacji właściciela wp-content
-        print(f"-> Krok 6: Weryfikacja właściciela '{target_wp_content_full_path}'...")
+        
+        print(f"-> Krok 1: Pobieranie skryptu uprawnień z {FIX_PERMISSIONS_SCRIPT_URL}...")
         try:
-             # Sprawdzamy ścieżkę bezwzględną
-             if os.path.exists(target_wp_content_full_path):
-                 stat_info = os.stat(target_wp_content_full_path)
-                 uid = stat_info.st_uid
-                 gid = stat_info.st_gid
-                 # Moduły pwd i grp są importowane na początku skryptu
-                 owner_name = pwd.getpwuid(uid).pw_name
-                 group_name = grp.getgrgid(gid).gr_name
-                 print(f"  Aktualny właściciel '{target_wp_content_full_path}': {owner_name}:{group_name}")
-                 if owner_name != WEB_USER or group_name != WEB_GROUP:
-                      print(f"  KRYTYCZNE OSTRZEŻENIE: Właściciel '{target_wp_content_full_path}' to {owner_name}:{group_name}, ale oczekiwano {WEB_USER}:{WEB_GROUP}! Komenda 'chown' mogła nie zadziałać poprawnie.", file=sys.stderr)
-                 else:
-                      print(f"  Weryfikacja właściciela '{target_wp_content_full_path}' OK.")
-             else:
-                 print(f"  Ostrzeżenie: Nie można zweryfikować właściciela, katalog '{target_wp_content_full_path}' nie istnieje.", file=sys.stderr)
-        except ImportError:
-             print("  Ostrzeżenie: Nie można zaimportować modułów pwd/grp do weryfikacji właściciela (może nie być dostępne w tym systemie).", file=sys.stderr)
-        except Exception as e:
-             print(f"  Ostrzeżenie: Wystąpił błąd podczas weryfikacji właściciela '{target_wp_content_full_path}': {e}", file=sys.stderr)
-        # --- KONIEC ZMODYFIKOWANEJ SEKCJI USTAWIANIA UPRAWNIEŃ ---
+            response = requests.get(FIX_PERMISSIONS_SCRIPT_URL, timeout=30)
+            response.raise_for_status() # Sprawdź błędy HTTP
+            
+            # Zapisz skrypt lokalnie
+            with open(fix_permissions_script_path, 'w', encoding='utf-8') as f:
+                f.write(response.text)
+            print(f"  Skrypt zapisany jako: {fix_permissions_script_path}")
+
+        except requests.exceptions.RequestException as e:
+            raise Exception(f"Błąd podczas pobierania skryptu uprawnień: {e}")
+        except IOError as e:
+             raise Exception(f"Błąd podczas zapisywania skryptu uprawnień do pliku '{fix_permissions_script_path}': {e}")
+
+        print(f"-> Krok 2: Nadawanie uprawnień do wykonania dla '{fix_permissions_script_path}'...")
+        try:
+            # Nadaj uprawnienia rwxr-xr-x (0o755)
+            os.chmod(fix_permissions_script_path, stat.S_IRWXU | stat.S_IRGRP | stat.S_IXGRP | stat.S_IROTH | stat.S_IXOTH)
+            print("  Uprawnienia do wykonania nadane.")
+        except OSError as e:
+             # Próbuj usunąć skrypt jeśli chmod zawiedzie
+             if os.path.exists(fix_permissions_script_path):
+                  try: os.remove(fix_permissions_script_path)
+                  except OSError: pass # Ignoruj błąd usuwania
+             raise Exception(f"Błąd podczas nadawania uprawnień do wykonania dla skryptu '{fix_permissions_script_path}': {e}")
+
+        print(f"-> Krok 3: Uruchamianie skryptu '{fix_permissions_script_path}'...")
+        # Uruchom skrypt za pomocą bash
+        # run_command oczekuje listy, więc przekazujemy listę z jednym elementem
+        script_run_result = run_command([fix_permissions_script_path], check=False) 
+        # run_command obsłuży logowanie stdout/stderr skryptu
+
+        if script_run_result is None or script_run_result.returncode != 0:
+             print(f"Ostrzeżenie: Wykonanie skryptu uprawnień '{fix_permissions_script_path}' zakończyło się błędem (kod {script_run_result.returncode if script_run_result else 'brak obiektu'}). Sprawdź logi powyżej.", file=sys.stderr)
+             # Nie przerywamy działania, ale logujemy ostrzeżenie
+        else:
+             print("  Skrypt uprawnień wykonany.")
+
+        print(f"-> Krok 4: Usuwanie tymczasowego skryptu '{fix_permissions_script_path}'...")
+        if os.path.exists(fix_permissions_script_path):
+            try:
+                os.remove(fix_permissions_script_path)
+                print("  Tymczasowy skrypt usunięty.")
+            except OSError as e:
+                print(f"Ostrzeżenie: Nie udało się usunąć tymczasowego skryptu '{fix_permissions_script_path}': {e}", file=sys.stderr)
+        else:
+             print(f"  Informacja: Tymczasowy skrypt '{fix_permissions_script_path}' nie istniał, nie ma czego usuwać.")
+        # --- KONIEC SEKCJI USTAWIANIA UPRAWNIEŃ ZA POMOCĄ ZEWNĘTRZNEGO SKRYPTU ---
+
 
         print("\nWykonywanie końcowych operacji WP-CLI...")
-        # Upewnij się, że jesteśmy w WP_ROOT_DIR
-        if os.getcwd() != WP_ROOT_DIR: # Ponowne sprawdzenie, na wszelki wypadek
+        if os.getcwd() != WP_ROOT_DIR: 
             os.chdir(WP_ROOT_DIR)
 
         print("Odświeżanie permanentnych linków...")
@@ -550,6 +577,14 @@ def main():
         traceback.print_exc(file=sys.stderr) 
         exit_code = 1
     finally:
+        # Upewnij się, że tymczasowy skrypt jest usuwany nawet w przypadku błędu (jeśli istnieje)
+        if os.path.exists(fix_permissions_script_path):
+             print(f"Sprzątanie: Usuwanie tymczasowego skryptu '{fix_permissions_script_path}' (po potencjalnym błędzie)...")
+             try:
+                  os.remove(fix_permissions_script_path)
+             except OSError as e:
+                  print(f"Ostrzeżenie: Nie udało się usunąć tymczasowego skryptu '{fix_permissions_script_path}' podczas sprzątania: {e}", file=sys.stderr)
+
         if exit_code != 0:
             print(f"\nWAŻNE: Katalog tymczasowy {FULL_TEMP_DIR} NIE został usunięty z powodu błędu. Sprawdź jego zawartość.", file=sys.stderr)
             print(f"Możesz go usunąć ręcznie: rm -rf {FULL_TEMP_DIR}", file=sys.stderr)
@@ -561,17 +596,15 @@ def main():
             print("\n---------------------------------------------------")
             print("Migracja zakończona pomyślnie!")
             print(f"Docelowa strona powinna teraz działać pod adresem: {NEW_URL}")
-            print(f"Skrypt WYKONAŁ automatyczne wyszukiwanie i zamianę URL-i")
-            print(f"(z '{SOURCE_DOMAIN}' i jego wariacji na '{NEW_URL}') we wszystkich tabelach z prefixem.")
-            print("Operacja wp search-replace została przeprowadzona z opcjami: --all-tables-with-prefix --recurse-objects --skip-columns=guid --precise --report-changed-only")
-            print("Skrypt próbował również ustawić poprawne uprawnienia plików i katalogów.")
-            print(f"Właściciel dla plików/katalogów powinien być ustawiony na {WEB_USER}:{WEB_GROUP}.")
-            print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera, w tym uprawnień plików!")
+            print(f"Skrypt WYKONAŁ automatyczne wyszukiwanie i zamianę URL-i.")
+            print("Uprawnienia plików zostały ustawione za pomocą zewnętrznego skryptu.")
+            print(f"Właściciel dla plików/katalogów powinien być ustawiony zgodnie z logiką skryptu {FIX_PERMISSIONS_SCRIPT_NAME}.")
+            print("Zawsze ZALECANE jest ręczne sprawdzenie strony po migracji oraz logów serwera!")
             print("---------------------------------------------------")
         elif exit_code == 0:
             print("\n---------------------------------------------------")
             print("Migracja zakończona (ale NEW_URL nie został ustalony - sprawdź logi).")
-            print("Sprawdź logi powyżej pod kątem ewentualnych ostrzeżeń lub błędów, w tym dotyczących uprawnień.")
+            print("Sprawdź logi powyżej pod kątem ewentualnych ostrzeżeń lub błędów.")
             print("---------------------------------------------------")
 
 
