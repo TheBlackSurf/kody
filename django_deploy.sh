@@ -15,9 +15,11 @@ NGINX_SITES_ENABLED_DIR="/etc/nginx/sites-enabled"
 NGINX_CONF_FILENAME="django.conf"
 NGINX_CONF_FILE_PATH="${NGINX_SITES_AVAILABLE_DIR}/${NGINX_CONF_FILENAME}"
 
-GUNICORN_SERVICE_RUNTIME_DIR_NAME="gunicorn_django"
-GUNICORN_SOCKET_PATH="/run/${GUNICORN_SERVICE_RUNTIME_DIR_NAME}/socket"
+GUNICORN_SERVICE_RUNTIME_DIR_NAME="gunicorn_django" # Nazwa katalogu w /run
+GUNICORN_SOCKET_PATH="/run/${GUNICORN_SERVICE_RUNTIME_DIR_NAME}/socket" # Pełna ścieżka do socketu
 GUNICORN_SERVICE_FILE="/etc/systemd/system/gunicorn_django.service"
+GUNICORN_SOCKET_SYSTEMD_FILE="/etc/systemd/system/${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
+
 VENV_NAME="venv"
 DEPLOY_LOG_FILE="/var/log/django_deploy.log"
 SETTINGS_UPDATER_PY_SCRIPT_PATH="/tmp/update_django_settings_$(date +%s).py"
@@ -93,9 +95,13 @@ done
 TIMESTAMP=$(date +%Y%m%d%H%M%S)
 if [ -f "$NGINX_CONF_FILE_PATH" ]; then log_msg "Tworzenie kopii zapasowej Nginx: ${NGINX_CONF_FILE_PATH}.${TIMESTAMP}.bak"; cp "$NGINX_CONF_FILE_PATH" "${NGINX_CONF_FILE_PATH}.${TIMESTAMP}.bak"; fi
 if [ -f "$GUNICORN_SERVICE_FILE" ]; then log_msg "Tworzenie kopii zapasowej Gunicorn: ${GUNICORN_SERVICE_FILE}.${TIMESTAMP}.bak"; cp "$GUNICORN_SERVICE_FILE" "${GUNICORN_SERVICE_FILE}.${TIMESTAMP}.bak"; fi
+if [ -f "$GUNICORN_SOCKET_SYSTEMD_FILE" ]; then log_msg "Tworzenie kopii zapasowej Gunicorn socket: ${GUNICORN_SOCKET_SYSTEMD_FILE}.${TIMESTAMP}.bak"; cp "$GUNICORN_SOCKET_SYSTEMD_FILE" "${GUNICORN_SOCKET_SYSTEMD_FILE}.${TIMESTAMP}.bak"; fi
+
 
 log_msg "Zatrzymywanie usług Gunicorn i Nginx..."
-systemctl stop gunicorn_django.service || log_warn "Usługa Gunicorn nie była uruchomiona lub nie udało się jej zatrzymać."
+systemctl stop gunicorn_django.service || log_warn "Usługa Gunicorn (service) nie była uruchomiona lub nie udało się jej zatrzymać."
+systemctl stop "${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket" || log_warn "Usługa Gunicorn (socket) nie była uruchomiona lub nie udało się jej zatrzymać."
+
 
 log_msg "Czyszczenie starego wdrożenia w $DEPLOY_DIR..."
 if [ -d "$DEPLOY_DIR" ]; then
@@ -150,7 +156,7 @@ fi
 
 if [ -f "$REQUIREMENTS_FILE_PATH" ]; then
     log_msg "Przetwarzanie pliku wymagań: $REQUIREMENTS_FILE_PATH"
-    if grep -qE "^psycopg2([^-]|$)" "$REQUIREMENTS_FILE_PATH"; then
+    if grep -qE "^psycopg2([^-=[:space:]]|$)" "$REQUIREMENTS_FILE_PATH"; then
         if ! dpkg -s libpq-dev &> /dev/null; then
             log_warn "'psycopg2' znaleziony, a 'libpq-dev' nie jest zainstalowany. Instaluję...";
             apt-get update -y && apt-get install -y libpq-dev || log_error "Nie udało się zainstalować libpq-dev."
@@ -167,7 +173,7 @@ if [ -f "$REQUIREMENTS_FILE_PATH" ]; then
         else log_warn "Nie udało się przekonwertować kodowania $REQUIREMENTS_FILE_PATH."; cp "$REQUIREMENTS_FILE_PATH" "$TEMP_REQ_UTF8"; fi
     fi
     log_msg "Instalowanie zależności z $TEMP_REQ_UTF8 (zachowując wersje)..."
-    if "$PIP_EXEC_PATH" install -r "$TEMP_REQ_UTF8"; then log_msg "Zależności zainstalowane."; else log_error "Błąd instalacji zależności."; exit 1; fi
+    if "$PIP_EXEC_PATH" install -r "$TEMP_REQ_UTF8"; then log_msg "Zależności z pliku wymagań zainstalowane."; else log_error "Błąd instalacji zależności z $REQUIREMENTS_FILE_PATH. Sprawdź logi pip powyżej oraz czy wszystkie pakiety są dostępne w PyPI."; exit 1; fi
     rm -f "$TEMP_REQ_UTF8"
 else
     log_warn "Brak requirements.txt/req.txt. Instaluję tylko Django i Gunicorn."; "$PIP_EXEC_PATH" install django gunicorn;
@@ -187,12 +193,11 @@ def log_py(m):
     print(f"PYTHON_SETTINGS_UPDATER: {m}", file=sys.stderr)
 
 def find_setting_block_indices(lines, key):
-    # Pattern for simple assignment or start of a list/tuple
     key_pattern = re.compile(rf"^\s*{re.escape(key)}\s*=\s*(\[|\(|\{{|True|False|None|['\"0-9])")
     start_index, end_index = -1, -1
-    open_brackets = 0
-    open_parentheses = 0
-    open_braces = 0 # For dicts, though less common for these settings
+    open_brackets = 0 # For lists []
+    open_parentheses = 0 # For tuples ()
+    open_braces = 0 # For dicts {}
     in_block_for_key = False
 
     for i, line in enumerate(lines):
@@ -203,12 +208,10 @@ def find_setting_block_indices(lines, key):
                 start_index = i
                 in_block_for_key = True
                 
-                # Count brackets/parentheses on the starting line
                 open_brackets += line.count('[') - line.count(']')
                 open_parentheses += line.count('(') - line.count(')')
                 open_braces += line.count('{') - line.count('}')
 
-                # If it's a single-line assignment (simple value or fully contained list/tuple/dict)
                 if open_brackets == 0 and open_parentheses == 0 and open_braces == 0:
                     end_index = i
                     break 
@@ -217,38 +220,38 @@ def find_setting_block_indices(lines, key):
             open_parentheses += line.count('(') - line.count(')')
             open_braces += line.count('{') - line.count('}')
             
-            if open_brackets == 0 and open_parentheses == 0 and open_braces == 0:
+            if open_brackets <= 0 and open_parentheses <= 0 and open_braces <=0 :
                 end_index = i
                 break
-            elif i == len(lines) - 1: # Reached end of file while block is still open
+            elif i == len(lines) - 1:
                 log_py(f"OSTRZEŻENIE: Blok dla '{key}' wydaje się być niekompletny na końcu pliku.")
-                end_index = i # Treat as end of block anyway
+                end_index = i
                 break
                 
     return start_index, end_index
 
 def update_setting_smart(lines, key, value_repr, comment=""):
+    key_assign_pattern_str = rf"^\s*{re.escape(key)}\s*=\s*.*"
     start_idx, end_idx = find_setting_block_indices(lines, key)
     
-    setting_line = f"{key} = {value_repr}  {comment}\n"
+    setting_line_content = f"{key} = {value_repr}  {comment}"
+    # Ensure it ends with a newline if it's a multi-line string itself, otherwise add one
+    if '\n' in value_repr.strip():
+        setting_lines_to_insert = [setting_line_content + '\n'] # Assume value_repr handles its own newlines if multiline
+    else:
+        setting_lines_to_insert = [setting_line_content.rstrip() + '\n']
 
-    if start_idx != -1 and end_idx != -1: # Setting found, replace its block
+
+    if start_idx != -1 and end_idx != -1:
         log_py(f"Ustawienie '{key}' znalezione między liniami {start_idx+1}-{end_idx+1}. Zastępowanie.")
-        # Ensure consistent newlines by splitting the new setting line if it's multiline
-        new_setting_lines = [l + '\n' for l in setting_line.strip().split('\n')]
-        lines = lines[:start_idx] + new_setting_lines + lines[end_idx+1:]
-    else: # Setting not found, add it
+        lines = lines[:start_idx] + setting_lines_to_insert + lines[end_idx+1:]
+    else:
         log_py(f"Ustawienie '{key}' nie znalezione. Dodawanie nowego.")
-        insertion_point = 0
-        base_dir_idx = -1
-        last_import_idx = -1
-        # Try to find BASE_DIR more reliably
+        insertion_point = 0; base_dir_idx = -1; last_import_idx = -1
         for i, line in enumerate(lines):
             s_line = line.strip()
-            if re.match(r"^\s*BASE_DIR\s*=\s*(Path\(|os\.path\.dirname\()", s_line):
-                base_dir_idx = i
-            if s_line.startswith("import ") or s_line.startswith("from "):
-                last_import_idx = i
+            if re.match(r"^\s*BASE_DIR\s*=\s*(Path\(|os\.path\.dirname\()", s_line): base_dir_idx = i
+            if s_line.startswith("import ") or s_line.startswith("from "): last_import_idx = i
         
         if base_dir_idx != -1:
             insertion_point = base_dir_idx + 1
@@ -256,34 +259,27 @@ def update_setting_smart(lines, key, value_repr, comment=""):
                 if lines[i].strip() == "" or lines[i].strip().startswith("#") or \
                    lines[i].strip().startswith("import ") or lines[i].strip().startswith("from ") or \
                    re.match(r"^[A-Z_0-9]+\s*=", lines[i].strip()):
-                    insertion_point = i 
-                    break
+                    insertion_point = i; break
                 insertion_point = i + 1 
         elif last_import_idx != -1:
             insertion_point = last_import_idx + 1
-            while insertion_point < len(lines) and (lines[insertion_point].strip() == "" or lines[insertion_point].strip().startswith("#")):
-                insertion_point += 1
+            while insertion_point < len(lines) and (lines[insertion_point].strip() == "" or lines[insertion_point].strip().startswith("#")): insertion_point += 1
         else: 
             insertion_point = 0
-            while insertion_point < len(lines) and (lines[insertion_point].strip() == "" or lines[insertion_point].strip().startswith("#")):
-                insertion_point +=1
-                
-        lines.insert(insertion_point, setting_line)
+            while insertion_point < len(lines) and (lines[insertion_point].strip() == "" or lines[insertion_point].strip().startswith("#")): insertion_point +=1
+        
+        # Insert lines one by one
+        for line_to_insert_idx, line_to_insert in enumerate(setting_lines_to_insert):
+             lines.insert(insertion_point + line_to_insert_idx, line_to_insert)
+
     return lines
 
 def main():
-    if len(sys.argv) != 7:
-        log_py(f"Błąd: Nieprawidłowa liczba argumentów. Oczekiwano 6, otrzymano {len(sys.argv)-1}")
-        sys.exit(1)
-
+    if len(sys.argv) != 7: log_py(f"Błąd: Nieprawidłowa liczba argumentów. Oczekiwano 6, otrzymano {len(sys.argv)-1}"); sys.exit(1)
     settings_file_path, new_allowed_hosts_csv, fixed_csrf_origins_csv, django_deploy_dir, project_module_name, is_debug_str = sys.argv[1:7]
     is_debug = is_debug_str.lower() == 'true'
 
-    log_py(f"Aktualizacja: {settings_file_path}")
-    log_py(f"DEBUG -> {is_debug}")
-    log_py(f"ALLOWED_HOSTS (skrypt) -> '{new_allowed_hosts_csv}'")
-    log_py(f"CSRF_TRUSTED_ORIGINS (stałe ze skryptu) -> '{fixed_csrf_origins_csv}'")
-    log_py(f"Katalog wdrożenia (dla STATIC/MEDIA): '{django_deploy_dir}'")
+    log_py(f"Aktualizacja: {settings_file_path}; DEBUG={is_debug}; ALLOWED_HOSTS+='{new_allowed_hosts_csv}'; CSRF_TRUSTED_ORIGINS+='{fixed_csrf_origins_csv}'; DEPLOY_DIR='{django_deploy_dir}'")
 
     try:
         with open(settings_file_path, 'r', encoding='utf-8') as f: lines = f.readlines()
@@ -291,27 +287,22 @@ def main():
 
     lines = update_setting_smart(lines, "DEBUG", "True" if is_debug else "False", "# Zmienione przez skrypt")
 
-    # ALLOWED_HOSTS: Merge existing with new from script
     final_allowed_hosts = set(['127.0.0.1', 'localhost'])
     start_idx_ah, end_idx_ah = find_setting_block_indices(lines, "ALLOWED_HOSTS")
     if start_idx_ah != -1:
         block_str_ah = "".join(lines[start_idx_ah : end_idx_ah+1])
-        match_ah = re.search(r'\[(.*?)\]', block_str_ah, re.DOTALL)
-        if match_ah: final_allowed_hosts.update([h.strip().strip("'\"") for h in match_ah.group(1).split(',') if h.strip()])
+        match = re.search(r'ALLOWED_HOSTS\s*=\s*\[(.*?)\]', block_str_ah, re.DOTALL)
+        if match: final_allowed_hosts.update([h.strip().strip("'\"") for h in match.group(1).split(',') if h.strip()])
     if new_allowed_hosts_csv: final_allowed_hosts.update([h.strip() for h in new_allowed_hosts_csv.split(',') if h.strip()])
     lines = update_setting_smart(lines, "ALLOWED_HOSTS", f"[{', '.join(sorted([repr(h) for h in final_allowed_hosts]))}]")
     
-    # CSRF_TRUSTED_ORIGINS: Merge existing with FIXED new from script
     final_csrf_origins = set()
     start_idx_csrf, end_idx_csrf = find_setting_block_indices(lines, "CSRF_TRUSTED_ORIGINS")
-    if start_idx_csrf != -1: # Parse existing if any
+    if start_idx_csrf != -1: 
         block_str_csrf = "".join(lines[start_idx_csrf : end_idx_csrf+1])
-        match_csrf = re.search(r'\[(.*?)\]', block_str_csrf, re.DOTALL)
-        if match_csrf: final_csrf_origins.update([o.strip().strip("'\"") for o in match_csrf.group(1).split(',') if o.strip()])
-    # Add the fixed origins passed from the bash script
-    if fixed_csrf_origins_csv:
-        final_csrf_origins.update([o.strip() for o in fixed_csrf_origins_csv.split(',') if o.strip()])
-    
+        match = re.search(r'CSRF_TRUSTED_ORIGINS\s*=\s*\[(.*?)\]', block_str_csrf, re.DOTALL)
+        if match: final_csrf_origins.update([o.strip().strip("'\"") for o in match.group(1).split(',') if o.strip()])
+    if fixed_csrf_origins_csv: final_csrf_origins.update([o.strip() for o in fixed_csrf_origins_csv.split(',') if o.strip()])
     lines = update_setting_smart(lines, "CSRF_TRUSTED_ORIGINS", f"[{', '.join(sorted([repr(o) for o in final_csrf_origins]))}]")
 
     base_dir_defined_pathlib = any("BASE_DIR = Path(__file__)" in line for line in lines)
@@ -319,7 +310,6 @@ def main():
 
     static_root_val = repr(os.path.join(django_deploy_dir, "staticfiles_collected"))
     media_root_val = repr(os.path.join(django_deploy_dir, "mediafiles"))
-    
     if base_dir_defined_pathlib:
         static_root_val = "BASE_DIR / 'staticfiles_collected'"
         media_root_val = "BASE_DIR / 'mediafiles'"
@@ -331,17 +321,16 @@ def main():
     lines = update_setting_smart(lines, "MEDIA_ROOT", media_root_val)
     lines = update_setting_smart(lines, "STATIC_URL", "'/static/'")
     lines = update_setting_smart(lines, "MEDIA_URL", "'/media/'")
-    lines = update_setting_smart(lines, "STATICFILES_DIRS", "[]", "# Wyczyczone/ustawione przez skrypt deploy.sh")
+    lines = update_setting_smart(lines, "STATICFILES_DIRS", "[]", "# Wyczyczone przez skrypt")
 
     needs_os = ("os.path.join(" in static_root_val or "os.path.join(" in media_root_val) and not any(re.match(r"^\s*import\s+os", line) for line in lines)
     needs_pathlib = ("BASE_DIR / " in static_root_val or "BASE_DIR / " in media_root_val) and not any(re.match(r"^\s*from\s+pathlib\s+import\s+Path", line) for line in lines)
-
     if needs_os or needs_pathlib:
         import_insertion_point = 0
         for i, line_content in enumerate(lines):
             if not line_content.strip().startswith('#') and line_content.strip() != "": import_insertion_point = i; break
-        if needs_os and not has_os: lines.insert(import_insertion_point, "import os\n"); log_py("Dodano 'import os'"); import_insertion_point +=1
-        if needs_pathlib and not has_pathlib: lines.insert(import_insertion_point, "from pathlib import Path\n"); log_py("Dodano 'from pathlib import Path'")
+        if needs_os and not any(re.match(r"^\s*import\s+os", line) for line in lines): lines.insert(import_insertion_point, "import os\n"); log_py("Dodano 'import os'"); import_insertion_point +=1
+        if needs_pathlib and not any(re.match(r"^\s*from\s+pathlib\s+import\s+Path", line) for line in lines): lines.insert(import_insertion_point, "from pathlib import Path\n"); log_py("Dodano 'from pathlib import Path'")
 
     try:
         with open(settings_file_path, 'w', encoding='utf-8') as f: f.writelines(lines)
@@ -354,9 +343,8 @@ if __name__ == "__main__":
 EOF_PYTHON_SETTINGS_UPDATER
 chmod +x "$SETTINGS_UPDATER_PY_SCRIPT_PATH"
 
-# Przygotowanie list domen dla ALLOWED_HOSTS (dynamicznie)
 DOMAINS_FOR_PY_ALLOWED_HOSTS="$MAIN_DOMAIN"
-AUTO_WWW_DOMAIN="" # Zmienna do przechowania automatycznie wygenerowanej domeny www
+AUTO_WWW_DOMAIN=""
 if [ -n "$WWW_ALIAS_DOMAIN" ]; then
     DOMAINS_FOR_PY_ALLOWED_HOSTS="${DOMAINS_FOR_PY_ALLOWED_HOSTS},${WWW_ALIAS_DOMAIN}"
 elif [[ "$MAIN_DOMAIN" != www.* ]]; then
@@ -364,13 +352,14 @@ elif [[ "$MAIN_DOMAIN" != www.* ]]; then
     DOMAINS_FOR_PY_ALLOWED_HOSTS="${DOMAINS_FOR_PY_ALLOWED_HOSTS},${AUTO_WWW_DOMAIN}"
 fi
 
-# STAŁA lista dla CSRF_TRUSTED_ORIGINS, używając głównej domeny
-FIXED_CSRF_ORIGINS_FOR_PY="https://${MAIN_DOMAIN}},http://${MAIN_DOMAIN}}"
-if [[ "$MAIN_DOMAIN" != www.* ]]; then # Jeśli domena główna nie jest www, dodaj www
-    FIXED_CSRF_ORIGINS_FOR_PY="${FIXED_CSRF_ORIGINS_FOR_PY},https://www.${MAIN_DOMAIN}},http://www.${MAIN_DOMAIN}}"
-elif [ -n "$WWW_ALIAS_DOMAIN" ] && [[ "$WWW_ALIAS_DOMAIN" == www.* ]]; then # Jeśli podano alias www, dodaj go
+# Poprawione generowanie FIXED_CSRF_ORIGINS_FOR_PY
+FIXED_CSRF_ORIGINS_FOR_PY="https://${MAIN_DOMAIN}},http://${MAIN_DOMAIN}"
+if [ -n "$AUTO_WWW_DOMAIN" ]; then
+    FIXED_CSRF_ORIGINS_FOR_PY="${FIXED_CSRF_ORIGINS_FOR_PY},https://${AUTO_WWW_DOMAIN}},http://${AUTO_WWW_DOMAIN}"
+elif [ -n "$WWW_ALIAS_DOMAIN" ]; then # Użyj podanego aliasu WWW, jeśli istnieje
     FIXED_CSRF_ORIGINS_FOR_PY="${FIXED_CSRF_ORIGINS_FOR_PY},https://${WWW_ALIAS_DOMAIN}},http://${WWW_ALIAS_DOMAIN}}"
 fi
+
 
 log_msg "Konfigurowanie pliku settings.py ($DJANGO_SETTINGS_PY_PATH)..."
 if ! "$PYTHON_EXEC_PATH" "$SETTINGS_UPDATER_PY_SCRIPT_PATH" \
@@ -379,8 +368,8 @@ if ! "$PYTHON_EXEC_PATH" "$SETTINGS_UPDATER_PY_SCRIPT_PATH" \
     "$FIXED_CSRF_ORIGINS_FOR_PY" \
     "$DEPLOY_DIR" \
     "$DJANGO_PROJECT_NAME" \
-    "false"; then # DEBUG=false
-    log_error "Skrypt Pythona do aktualizacji settings.py ($SETTINGS_UPDATER_PY_SCRIPT_PATH) zakończył się błędem."
+    "false"; then
+    log_error "Skrypt Pythona ($SETTINGS_UPDATER_PY_SCRIPT_PATH) zakończył się błędem."
     exit 1
 fi
 log_msg "Plik settings.py skonfigurowany."
@@ -390,49 +379,41 @@ log_msg "Uruchamianie poleceń zarządzania Django..."
 mkdir -p "${DEPLOY_DIR}/staticfiles_collected"
 mkdir -p "${DEPLOY_DIR}/mediafiles"
 chown -R "${DEPLOY_USER}:${DEPLOY_GROUP}" "${DEPLOY_DIR}/staticfiles_collected" "${DEPLOY_DIR}/mediafiles"
-
 cd "$DEPLOY_DIR"
 
 log_msg "Uruchamianie collectstatic..."
 if "$PYTHON_EXEC_PATH" manage.py collectstatic --noinput --clear; then
     log_msg "Polecenie collectstatic zakończone pomyślnie."
 else
-    log_error "Polecenie collectstatic nie powiodło się. Sprawdź logi powyżej oraz $DEPLOY_LOG_FILE."
-    # Dodatkowe logowanie błędu collectstatic
-    "$PYTHON_EXEC_PATH" manage.py collectstatic --noinput --clear >> "$DEPLOY_LOG_FILE" 2>&1 || true 
-    exit 1
+    log_error "Polecenie collectstatic nie powiodło się."; "$PYTHON_EXEC_PATH" manage.py collectstatic --noinput --clear >> "$DEPLOY_LOG_FILE" 2>&1 || true ; exit 1;
 fi
 
 log_msg "Uruchamianie migracji bazy danych..."
 if "$PYTHON_EXEC_PATH" manage.py migrate --noinput; then
     log_msg "Migracje bazy danych zakończone pomyślnie."
 else
-    log_error "Migracje Django nie powiodły się. Sprawdź logi powyżej oraz $DEPLOY_LOG_FILE."
-    exit 1
+    log_error "Migracje Django nie powiodły się."; exit 1;
 fi
 
 log_msg "Konfigurowanie usługi Gunicorn..."
 cat > "$GUNICORN_SERVICE_FILE" << EOF
 [Unit]
 Description=Gunicorn daemon for Django project at $DEPLOY_DIR
-Requires=network.target gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket
-After=network.target gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket
+Requires=${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket
+After=network.target ${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket
 
 [Service]
 User=$DEPLOY_USER
 Group=$DEPLOY_GROUP
 WorkingDirectory=$DEPLOY_DIR
-ExecStart=${PYTHON_VENV_PATH}/bin/gunicorn --access-logfile - --error-logfile - --workers 3 --bind unix:${GUNICORN_SOCKET_PATH} ${DJANGO_PROJECT_NAME}.wsgi:application
+ExecStart=${PYTHON_EXEC_PATH} ${PYTHON_VENV_PATH}/bin/gunicorn --access-logfile - --error-logfile - --workers 3 --bind unix:${GUNICORN_SOCKET_PATH} ${DJANGO_PROJECT_NAME}.wsgi:application
 Restart=always
 
 [Install]
 WantedBy=multi-user.target
 EOF
 
-# Oddzielny plik socket dla Gunicorn, zarządzany przez systemd
-if [ ! -f "/etc/systemd/system/gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket" ]; then
-log_msg "Tworzenie pliku gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket..."
-cat > "/etc/systemd/system/gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket" <<EOF_GUNICORN_SOCKET
+if [ ! -f "$GUNICORN_SOCKET_SYSTEMD_FILE" ] || ! cmp -s "$GUNICORN_SOCKET_SYSTEMD_FILE" <(cat <<EOF_GUNICORN_SOCKET_COMPARE
 [Unit]
 Description=gunicorn socket for ${DJANGO_PROJECT_NAME}
 
@@ -440,16 +421,29 @@ Description=gunicorn socket for ${DJANGO_PROJECT_NAME}
 ListenStream=${GUNICORN_SOCKET_PATH}
 SocketUser=$DEPLOY_USER
 SocketGroup=$DEPLOY_GROUP
-SocketMode=0660 # Umożliwia Nginx (zwykle w grupie www-data) odczyt/zapis
+SocketMode=0660
+
+[Install]
+WantedBy=sockets.target
+EOF_GUNICORN_SOCKET_COMPARE
+); then
+    log_msg "Tworzenie lub aktualizowanie pliku ${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket..."
+    cat > "$GUNICORN_SOCKET_SYSTEMD_FILE" <<EOF_GUNICORN_SOCKET
+[Unit]
+Description=gunicorn socket for ${DJANGO_PROJECT_NAME}
+
+[Socket]
+ListenStream=${GUNICORN_SOCKET_PATH}
+SocketUser=$DEPLOY_USER
+SocketGroup=$DEPLOY_GROUP
+SocketMode=0660
 
 [Install]
 WantedBy=sockets.target
 EOF_GUNICORN_SOCKET
-systemctl enable "gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
-systemctl start "gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
+    systemctl enable "${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
 fi
-
-log_msg "Plik usługi Gunicorn ($GUNICORN_SERVICE_FILE) utworzony/zaktualizowany."
+log_msg "Plik usługi Gunicorn ($GUNICORN_SERVICE_FILE) i socketu ($GUNICORN_SOCKET_SYSTEMD_FILE) utworzone/zaktualizowane."
 
 log_msg "Konfigurowanie Nginx..."
 NGINX_SERVER_NAMES_LINE_CONTENT="$MAIN_DOMAIN"
@@ -502,44 +496,38 @@ fi
 
 log_msg "Plik konfiguracyjny Nginx ($NGINX_CONF_FILE_PATH) utworzony/zaktualizowany."
 if [ -L "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME" ] && [ "$(readlink -f "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME")" != "$NGINX_CONF_FILE_PATH" ]; then
-    log_warn "Usuwanie starego dowiązania Nginx: $NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME"; rm -f "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME"; fi
+    log_warn "Usuwanie starego dowiązania Nginx..."; rm -f "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME"; fi
 if [ ! -L "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME" ]; then
-    ln -s "$NGINX_CONF_FILE_PATH" "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME"; log_msg "Utworzono dowiązanie dla Nginx."; fi
+    ln -s "$NGINX_CONF_FILE_PATH" "$NGINX_SITES_ENABLED_DIR/$NGINX_CONF_FILENAME"; log_msg "Utworzono dowiązanie Nginx."; fi
 
 log_msg "Testowanie konfiguracji Nginx..."
-if nginx -t; then log_msg "Konfiguracja Nginx jest poprawna."; else log_error "Błąd w konfiguracji Nginx."; exit 1; fi
+if nginx -t; then log_msg "Konfiguracja Nginx poprawna."; else log_error "Błąd konfiguracji Nginx."; exit 1; fi
 
 log_msg "Przeładowywanie demona systemd..."
 systemctl daemon-reload
 
 log_msg "Włączanie i restartowanie usług Gunicorn..."
-systemctl enable "gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
-systemctl start "gunicorn_${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
+systemctl enable "${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
+systemctl restart "${GUNICORN_SERVICE_RUNTIME_DIR_NAME}.socket"
 systemctl enable gunicorn_django.service
 systemctl restart gunicorn_django.service
 log_msg "Czekam 5 sekund na Gunicorn..."
 sleep 5 
 if ! systemctl is-active --quiet gunicorn_django.service; then
-    log_error "Usługa Gunicorn nie uruchomiła się. Sprawdź:";
-    log_error "  sudo systemctl status gunicorn_django.service"
-    log_error "  sudo journalctl -u gunicorn_django.service -n 50 --no-pager"
-    exit 1
+    log_error "Gunicorn nie uruchomił się. Sprawdź: sudo systemctl status gunicorn_django.service ORAZ sudo journalctl -u gunicorn_django.service -n 50 --no-pager"; exit 1;
 fi
-log_msg "Usługa Gunicorn pomyślnie (re)startowana."
+log_msg "Gunicorn pomyślnie (re)startowany."
 
 log_msg "Restartowanie usługi Nginx..."
 systemctl restart nginx.service
 if ! systemctl is-active --quiet nginx.service; then
-    log_error "Usługa Nginx nie uruchomiła się. Sprawdź:";
-    log_error "  sudo systemctl status nginx.service"
-    log_error "  sudo journalctl -u nginx.service -n 50 --no-pager"
-    exit 1
+    log_error "Nginx nie uruchomił się. Sprawdź: sudo systemctl status nginx.service ORAZ sudo journalctl -u nginx.service -n 50 --no-pager"; exit 1;
 fi
-log_msg "Usługa Nginx pomyślnie zrestartowana."
+log_msg "Nginx pomyślnie zrestartowany."
 
 chown -R "${DEPLOY_USER}:${DEPLOY_GROUP}" "${DEPLOY_DIR}"
 log_msg "Wdrożenie zakończone pomyślnie!"
-log_msg "Aplikacja powinna być dostępna pod adresem: http://$MAIN_DOMAIN"
+log_msg "Aplikacja: http://$MAIN_DOMAIN"
 if [ -n "$AUTO_WWW_DOMAIN" ]; then log_msg "oraz http://$AUTO_WWW_DOMAIN"; fi
 if [ -n "$WWW_ALIAS_DOMAIN" ]; then log_msg "oraz http://$WWW_ALIAS_DOMAIN"; fi
 
